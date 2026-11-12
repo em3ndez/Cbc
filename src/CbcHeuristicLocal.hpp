@@ -28,6 +28,9 @@ public:
   /// Clone
   virtual CbcHeuristic *clone() const;
 
+  /// Classification: improvement heuristic (needs ≥2 solutions)
+  virtual HeuristicCategory category() const { return HeuristicCategory::IMPROVEMENT_2; }
+
   /// Assignment operator
   CbcHeuristicLocal &operator=(const CbcHeuristicLocal &rhs);
 
@@ -54,6 +57,9 @@ public:
     */
   virtual int solution(double &objectiveValue,
     double *newSolution);
+
+  /// The heuristic proper; solution() adds the invocation control around it
+  int solutionImpl(double &objectiveValue, double *newSolution);
   /// This version fixes stuff and does IP
   int solutionFix(double &objectiveValue,
     double *newSolution,
@@ -105,6 +111,9 @@ public:
   /// Clone
   virtual CbcHeuristic *clone() const;
 
+  /// Classification: improvement heuristic (needs ≥1 solution)
+  virtual HeuristicCategory category() const { return HeuristicCategory::IMPROVEMENT; }
+
   /// Assignment operator
   CbcHeuristicProximity &operator=(const CbcHeuristicProximity &rhs);
 
@@ -123,6 +132,9 @@ public:
     */
   virtual int solution(double &objectiveValue,
     double *newSolution);
+
+  /// The heuristic proper; solution() adds the invocation control around it
+  int solutionImpl(double &objectiveValue, double *newSolution);
   /// Set extra increment
   inline void setIncrement(double value)
   {
@@ -229,6 +241,9 @@ public:
   /// Clone
   virtual CbcHeuristic *clone() const;
 
+  /// Classification: improvement heuristic (needs ≥2 solutions)
+  virtual HeuristicCategory category() const { return HeuristicCategory::IMPROVEMENT_2; }
+
   /// Assignment operator
   CbcHeuristicCrossover &operator=(const CbcHeuristicCrossover &rhs);
 
@@ -249,6 +264,9 @@ public:
     */
   virtual int solution(double &objectiveValue,
     double *newSolution);
+
+  /// The heuristic proper; solution() adds the invocation control around it
+  int solutionImpl(double &objectiveValue, double *newSolution);
 
   /// Sets number of solutions to use
   inline void setNumberSolutions(int value)

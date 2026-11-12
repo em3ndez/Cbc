@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cfloat>
 
+#include "CoinTime.hpp"
+#include "OsiClpSolverInterface.hpp"
 #include "OsiSolverInterface.hpp"
 #include "CbcModel.hpp"
 #include "CbcMessage.hpp"
@@ -109,11 +111,30 @@ int CbcHeuristicRENS::solution(double &solutionValue,
   const int *integerVariable = model_->integerVariable();
 
   OsiSolverInterface *newSolver = cloneBut(3); // was model_->continuousSolver()->clone();
+
+  // Propagate remaining CBC time to the LP solver so individual re-solves
+  // cannot run past the global deadline.  Also bail out immediately if the
+  // time budget is already exhausted.
+  if (model_->maximumSecondsReached()) {
+    delete newSolver;
+    return 0;
+  }
+  if (model_->getMaximumSeconds() < 1.0e10) {
+    OsiClpSolverInterface *clpSolverR = getClpSolver(newSolver);
+    if (clpSolverR) {
+      double remaining = std::max(model_->getMaximumSeconds() - model_->getCurrentSeconds(), 0.0);
+      if (model_->useElapsedTime())
+        clpSolverR->getModelPtr()->setMaximumWallSeconds(remaining);
+      else
+        clpSolverR->getModelPtr()->setMaximumSeconds(remaining);
+    }
+  }
+
   const double *currentSolution = newSolver->getColSolution();
   int type = rensType_ & 15;
   if (type < 12)
     newSolver->resolve();
-  double direction = newSolver->getObjSense();
+  double direction = newSolver->getObjSenseInCbc();
   double cutoff = model_->getCutoff();
   newSolver->setDblParam(OsiDualObjectiveLimit, 1.0e100);
   //cutoff *= direction;
@@ -131,6 +152,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         << CoinMessageEol;
     }
   } else if (type < 12) {
+    delete newSolver;
     return 0; // finished?
   }
   int numberColumns = solver->getNumCols();
@@ -208,7 +230,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
                 if (element[j] != 1.0)
                   bestDj[iRow] = 1.0e30;
                 else
-                  bestDj[iRow] = CoinMin(fabs(dj[iColumn]), bestDj[iRow]);
+                  bestDj[iRow] = std::min(fabs(dj[iColumn]), bestDj[iRow]);
               }
             }
           }
@@ -526,7 +548,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
                 int numberTimesAtOne = mark[iColumn];
                 int numberTimesNonZero = nonzero[iColumn] + numberTimesAtOne;
                 if (numberTimesAtOne < nCheck && numberTimesNonZero) {
-                  mixed[iSOS] += CoinMin(numberTimesNonZero,
+                  mixed[iSOS] += std::min(numberTimesNonZero,
                     nCheck - numberTimesNonZero);
                 }
               }
@@ -540,7 +562,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
             }
           }
           CoinSort_2(sort, sort + nFix, mixed);
-          nFix = CoinMin(nFix, numberSetsToFix);
+          nFix = std::min(nFix, numberSetsToFix);
           memset(sort, 0, sizeof(double) * numberRows);
           for (int i = 0; i < nFix; i++)
             sort[mixed[i]] = 1.0;
@@ -600,7 +622,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
     }
     std::sort(sort, sort + numberColumns);
     int last = static_cast< int >(numberColumns * fractionSmall_);
-    djTolerance = CoinMax(sort[last], 1.0e-5);
+    djTolerance = std::max(sort[last], 1.0e-5);
     delete[] sort;
   } else if (type == 12) {
     // Do layered in a different way
@@ -700,6 +722,8 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         }
       }
       // solve
+      if (model_->maximumSecondsReached())
+        break;
       returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
         model_->getCutoff(), "CbcHeuristicRENS");
       if (returnCode < 0) {
@@ -728,8 +752,10 @@ int CbcHeuristicRENS::solution(double &solutionValue,
   solver->getDblParam(OsiPrimalTolerance, primalTolerance);
 
   int i;
+#ifdef CLP_INVESTIGATE2
   int numberTightened = 0;
   int numberAtBound = 0;
+#endif
   int numberContinuous = numberColumns - numberIntegers;
   /*
       0 - allow fixing
@@ -743,8 +769,8 @@ int CbcHeuristicRENS::solution(double &solutionValue,
       double value = currentSolution[iColumn];
       double lower = colLower[iColumn];
       double upper = colUpper[iColumn];
-      value = CoinMax(value, lower);
-      value = CoinMin(value, upper);
+      value = std::max(value, lower);
+      value = std::min(value, upper);
       if (fabs(bestSolution[iColumn] - value) > 0.999)
         marked[iColumn] = 1;
     }
@@ -754,8 +780,8 @@ int CbcHeuristicRENS::solution(double &solutionValue,
     int highPriority = COIN_INT_MAX;
     for (i = 0; i < numberIntegers; i++) {
       int priority = model_->priority(i);
-      lowPriority = CoinMax(lowPriority, priority);
-      highPriority = CoinMin(highPriority, priority);
+      lowPriority = std::max(lowPriority, priority);
+      highPriority = std::min(highPriority, priority);
     }
     if (highPriority < lowPriority) {
       int keepPriority = ((rensType_ & 64) != 0) ? highPriority : lowPriority;
@@ -772,8 +798,8 @@ int CbcHeuristicRENS::solution(double &solutionValue,
     double value = currentSolution[iColumn];
     double lower = colLower[iColumn];
     double upper = colUpper[iColumn];
-    value = CoinMax(value, lower);
-    value = CoinMin(value, upper);
+    value = std::max(value, lower);
+    value = std::min(value, upper);
     double djValue = dj[iColumn] * direction;
     bool dontFix = marked[iColumn] != 0;
 #define RENS_FIX_ONLY_LOWER
@@ -783,13 +809,19 @@ int CbcHeuristicRENS::solution(double &solutionValue,
       if (dontFix) {
         continue;
       }
+#ifdef CLP_INVESTIGATE2
       if (value == lower || value == upper)
         numberAtBound++;
+#endif
       newSolver->setColLower(iColumn, value);
       newSolver->setColUpper(iColumn, value);
+#ifdef CLP_INVESTIGATE2
       numberFixed++;
+#endif
     } else if (colUpper[iColumn] - colLower[iColumn] >= 2.0) {
+#ifdef CLP_INVESTIGATE2
       numberTightened++;
+#endif
       newSolver->setColLower(iColumn, floor(value));
       newSolver->setColUpper(iColumn, ceil(value));
     }
@@ -799,7 +831,9 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         continue;
       }
       value = floor(value + 0.5);
+#ifdef CLP_INVESTIGATE2
       numberAtBound++;
+#endif
       newSolver->setColLower(iColumn, value);
       newSolver->setColUpper(iColumn, value);
       numberFixed++;
@@ -808,17 +842,21 @@ int CbcHeuristicRENS::solution(double &solutionValue,
       if (dontFix) {
         continue;
       }
+#ifdef CLP_INVESTIGATE2
       numberAtBound++;
+#endif
       newSolver->setColLower(iColumn, value);
       newSolver->setColUpper(iColumn, value);
       numberFixed++;
     } else if (colUpper[iColumn] - colLower[iColumn] >= 2.0 && djTolerance < 0.0) {
+#ifdef CLP_INVESTIGATE2
       numberTightened++;
+#endif
       if (fabs(value - floor(value + 0.5)) < 1.0e-8) {
         value = floor(value + 0.5);
         if (value < upper) {
-          newSolver->setColLower(iColumn, CoinMax(value - 1.0, lower));
-          newSolver->setColUpper(iColumn, CoinMin(value + 1.0, upper));
+          newSolver->setColLower(iColumn, std::max(value - 1.0, lower));
+          newSolver->setColUpper(iColumn, std::min(value + 1.0, upper));
         } else {
           newSolver->setColLower(iColumn, upper - 1.0);
         }
@@ -854,7 +892,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         // fix some continuous
         double *sort = new double[nAtLb];
         int *which = new int[nAtLb];
-        double threshold = CoinMax((0.01 * sumDj) / static_cast< double >(nAtLb), 1.0e-6);
+        double threshold = std::max((0.01 * sumDj) / static_cast< double >(nAtLb), 1.0e-6);
         int nFix2 = 0;
         for (int iColumn = 0; iColumn < numberColumns; iColumn++) {
           if (!newSolver->isInteger(iColumn)) {
@@ -869,7 +907,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
           }
         }
         CoinSort_2(sort, sort + nFix2, which);
-        nFix2 = CoinMin(nFix2, (numberColumns - numberFixed) / 2);
+        nFix2 = std::min(nFix2, (numberColumns - numberFixed) / 2);
         for (int i = 0; i < nFix2; i++) {
           int iColumn = which[i];
           newSolver->setColUpper(iColumn, colLower[iColumn]);
@@ -886,6 +924,11 @@ int CbcHeuristicRENS::solution(double &solutionValue,
 #ifdef COIN_DEVELOP
     printf("%d integers fixed and %d tightened\n", numberFixed, numberTightened);
 #endif
+    if (model_->maximumSecondsReached()) {
+      fractionSmall_ = saveFractionSmall;
+      delete newSolver;
+      return 0;
+    }
     returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
       model_->getCutoff(), "CbcHeuristicRENS");
     if (returnCode < 0 || returnCode == 0) {
@@ -896,7 +939,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         int nAtLb = 0;
         double sumDj = 0.0;
         const double *dj = newSolver->getReducedCost();
-        double direction = newSolver->getObjSense();
+        double direction = newSolver->getObjSenseInCbc();
         for (int iColumn = 0; iColumn < numberColumns; iColumn++) {
           if (!newSolver->isInteger(iColumn)) {
             double value = currentSolution[iColumn];
@@ -911,7 +954,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
           // fix some continuous
           double *sort = new double[nAtLb];
           int *which = new int[nAtLb];
-          double threshold = CoinMax((0.01 * sumDj) / static_cast< double >(nAtLb), 1.0e-6);
+          double threshold = std::max((0.01 * sumDj) / static_cast< double >(nAtLb), 1.0e-6);
           int nFix2 = 0;
           for (int iColumn = 0; iColumn < numberColumns; iColumn++) {
             if (!newSolver->isInteger(iColumn)) {
@@ -926,7 +969,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
             }
           }
           CoinSort_2(sort, sort + nFix2, which);
-          nFix2 = CoinMin(nFix2, (numberColumns - numberFixed) / 2);
+          nFix2 = std::min(nFix2, (numberColumns - numberFixed) / 2);
           for (int i = 0; i < nFix2; i++) {
             int iColumn = which[i];
             newSolver->setColUpper(iColumn, colLower[iColumn]);
@@ -938,8 +981,9 @@ int CbcHeuristicRENS::solution(double &solutionValue,
             numberFixed, numberTightened, numberAtBound, nFix2);
 #endif
         }
-        returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
-          model_->getCutoff(), "CbcHeuristicRENS");
+        if (!model_->maximumSecondsReached())
+          returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
+            model_->getCutoff(), "CbcHeuristicRENS");
       }
 #endif
       if (returnCode < 0 || returnCode == 0) {
@@ -955,8 +999,10 @@ int CbcHeuristicRENS::solution(double &solutionValue,
 #endif
         for (int iPass = 0; iPass < RENS_PASS; iPass++) {
           int nFixed = 0;
+#ifdef CLP_INVESTIGATE2
           int nFixedAlready = 0;
           int nFixedContinuous = 0;
+#endif
           for (int iColumn = 0; iColumn < numberColumns; iColumn++) {
             if (colUpper[iColumn] > colLower[iColumn]) {
               if (newSolver->isInteger(iColumn)) {
@@ -969,10 +1015,12 @@ int CbcHeuristicRENS::solution(double &solutionValue,
                   newSolver->setColUpper(iColumn, fixTo);
                 }
               }
+#ifdef CLP_INVESTIGATE2
             } else if (newSolver->isInteger(iColumn)) {
               nFixedAlready++;
             } else {
               nFixedContinuous++;
+#endif
             }
           }
 #ifdef CLP_INVESTIGATE2
@@ -996,7 +1044,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
 #else
           if (nFixed) {
             newSolver->resolve();
-            if (!newSolver->isProvenOptimal()) {
+            if (!newSolver->isProvenOptimal() || model_->maximumSecondsReached()) {
               returnCode = 0;
               break;
             }
@@ -1020,7 +1068,7 @@ int CbcHeuristicRENS::solution(double &solutionValue,
         }
         delete[] saveLower;
         delete[] saveUpper;
-        if (nSolved)
+        if (nSolved && !model_->maximumSecondsReached())
           returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
             model_->getCutoff(), "CbcHeuristicRENS");
         else

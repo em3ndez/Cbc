@@ -10,17 +10,19 @@
 
 # Name of the library compiled in this directory.
 # We want it to be installed in the 'lib' directory
-lib_LTLIBRARIES = libCbc.la libCbcSolver.la
+lib_LTLIBRARIES = libCbc.la
 
 # List all source files for this library, including headers
 libCbc_la_SOURCES = \
 	CbcConfig.h \
+	CbcBab.cpp \
 	CbcBranchActual.hpp \
 	CbcBranchAllDifferent.cpp CbcBranchAllDifferent.hpp \
 	CbcBranchBase.hpp \
 	CbcBranchCut.cpp CbcBranchCut.hpp \
 	CbcBranchDecision.cpp CbcBranchDecision.hpp \
 	CbcBranchDefaultDecision.cpp CbcBranchDefaultDecision.hpp \
+	CbcBranchingRanker.cpp CbcBranchingRanker.hpp \
 	CbcBranchDynamic.cpp CbcBranchDynamic.hpp \
 	CbcBranchingObject.cpp CbcBranchingObject.hpp \
 	CbcBranchLotsize.cpp CbcBranchLotsize.hpp \
@@ -36,6 +38,7 @@ libCbc_la_SOURCES = \
 	CbcCompare.hpp \
 	CbcCountRowCut.cpp CbcCountRowCut.hpp \
 	CbcCutGenerator.cpp CbcCutGenerator.hpp \
+	CbcCutPoolFilter.cpp CbcCutPoolFilter.hpp \
 	CbcCutModifier.cpp CbcCutModifier.hpp \
 	CbcCutSubsetModifier.cpp CbcCutSubsetModifier.hpp \
 	CbcDummyBranchingObject.cpp CbcDummyBranchingObject.hpp \
@@ -49,62 +52,80 @@ libCbc_la_SOURCES = \
 	CbcGeneral.cpp CbcGeneral.hpp \
 	CbcGeneralDepth.cpp CbcGeneralDepth.hpp \
 	CbcHeuristic.cpp CbcHeuristic.hpp \
+	CbcHeuristicControl.cpp CbcHeuristicControl.hpp \
 	CbcHeuristicDINS.cpp CbcHeuristicDINS.hpp \
 	CbcHeuristicDive.cpp CbcHeuristicDive.hpp \
 	CbcHeuristicDiveCoefficient.cpp CbcHeuristicDiveCoefficient.hpp \
+	CbcHeuristicDiveConfigurable.cpp CbcHeuristicDiveConfigurable.hpp \
+	CbcDiveScheduler.cpp CbcDiveScheduler.hpp \
+	CbcRootHeuristicSchedule.cpp CbcRootHeuristicSchedule.hpp \
 	CbcHeuristicDiveFractional.cpp CbcHeuristicDiveFractional.hpp \
 	CbcHeuristicDiveGuided.cpp CbcHeuristicDiveGuided.hpp \
 	CbcHeuristicDiveLineSearch.cpp CbcHeuristicDiveLineSearch.hpp \
 	CbcHeuristicDivePseudoCost.cpp CbcHeuristicDivePseudoCost.hpp \
 	CbcHeuristicDiveVectorLength.cpp CbcHeuristicDiveLength.hpp \
 	CbcHeuristicFPump.cpp CbcHeuristicFPump.hpp \
+	CbcHeuristicFeasibilityJump.cpp CbcHeuristicFeasibilityJump.hpp \
+	feasibilityjump.hh \
 	CbcHeuristicGreedy.cpp CbcHeuristicGreedy.hpp \
 	CbcHeuristicLocal.cpp CbcHeuristicLocal.hpp \
 	CbcHeuristicPivotAndFix.cpp CbcHeuristicPivotAndFix.hpp \
+	CbcHeuristicSppGrasp.cpp CbcHeuristicSppGrasp.hpp \
+	CbcSppGraspAcceptance.hpp \
+	CbcSppGraspGuide.hpp \
 	CbcHeuristicRandRound.cpp CbcHeuristicRandRound.hpp \
 	CbcHeuristicRENS.cpp CbcHeuristicRENS.hpp \
 	CbcHeuristicRINS.cpp CbcHeuristicRINS.hpp \
 	CbcHeuristicVND.cpp CbcHeuristicVND.hpp \
 	CbcHeuristicDW.cpp CbcHeuristicDW.hpp \
 	CbcMessage.cpp CbcMessage.hpp \
+	CbcOutput.cpp CbcOutput.hpp \
+	CbcMipStart.cpp CbcMipStart.hpp \
 	CbcModel.cpp CbcModel.hpp \
 	CbcNode.cpp CbcNode.hpp \
 	CbcNodeInfo.cpp CbcNodeInfo.hpp \
 	CbcNWay.cpp CbcNWay.hpp \
 	CbcObject.cpp CbcObject.hpp \
 	CbcObjectUpdateData.cpp CbcObjectUpdateData.hpp \
+	CbcParam.cpp CbcParam.hpp \
+	CbcParamUtils.cpp CbcParamUtils.hpp \
 	CbcPartialNodeInfo.cpp CbcPartialNodeInfo.hpp \
+	CbcPartialSolutionPool.cpp CbcPartialSolutionPool.hpp \
 	CbcSimpleInteger.cpp CbcSimpleInteger.hpp \
 	CbcSimpleIntegerDynamicPseudoCost.cpp \
 	CbcSimpleIntegerDynamicPseudoCost.hpp \
 	CbcSimpleIntegerPseudoCost.cpp \
 	CbcSimpleIntegerPseudoCost.hpp \
-	CbcSOS.cpp CbcSOS.hpp \
+	CbcSOS.cpp CbcSOS.hpp CbcSolution.cpp \
+	CbcPostprocessRepair.cpp CbcPostprocessRepair.hpp \
+	CbcSolver.cpp \
+	CbcLpParamScorer.cpp CbcLpParamScorer.hpp \
+	CbcSolverAnalyze.cpp CbcSolverAnalyze.hpp \
+	CbcSolverCutSetup.cpp CbcSolverCutSetup.hpp \
+	CbcProblemClassifier.cpp CbcProblemClassifier.hpp \
+	CbcSolverExpandKnapsack.cpp CbcSolverExpandKnapsack.hpp \
+	CbcSolverHeuristics.cpp CbcSolverHeuristics.hpp \
+	CbcParameters.cpp CbcParameters.hpp \
 	CbcStatistics.cpp CbcStatistics.hpp \
+	CbcSolverStatistics.cpp CbcSolverStatistics.hpp \
+	CbcInstanceFeatures.cpp CbcInstanceFeatures.hpp \
+	CbcBoundPropagation.cpp CbcBoundPropagation.hpp \
+	CbcCoefficientStrengthening.cpp CbcCoefficientStrengthening.hpp \
+	CbcRowReductions.cpp CbcRowReductions.hpp \
 	CbcStrategy.cpp CbcStrategy.hpp \
 	CbcSubProblem.cpp CbcSubProblem.hpp \
 	CbcSymmetry.cpp CbcSymmetry.hpp \
 	CbcThread.cpp CbcThread.hpp \
 	CbcTree.cpp CbcTree.hpp \
-	CbcTreeLocal.cpp CbcTreeLocal.hpp
-
-libCbcSolver_la_SOURCES = \
+	CbcTreeLocal.cpp CbcTreeLocal.hpp \
 	Cbc_C_Interface.cpp Cbc_C_Interface.h \
-	CbcCbcParam.cpp \
-	CbcLinked.cpp CbcLinked.hpp CbcLinkedUtils.cpp \
-	unitTestClp.cpp CbcSolver.cpp \
-	CbcSolverHeuristics.cpp CbcSolverHeuristics.hpp \
-	CbcSolverAnalyze.cpp CbcSolverAnalyze.hpp \
-	CbcMipStartIO.cpp CbcMipStartIO.hpp \
-	CbcSolverExpandKnapsack.cpp CbcSolverExpandKnapsack.hpp
+	CbcLinked.cpp CbcLinked.hpp CbcLinkedUtils.cpp
 
 # List all additionally required libraries
 libCbc_la_LIBADD = $(CBCLIB_LFLAGS)
-libCbcSolver_la_LIBADD = $(CBCSOLVERLIB_LFLAGS) libCbc.la
 
 # Some common setup for cbc and cbc-generic.
 libCbc_la_CPPFLAGS = $(CBCLIB_CFLAGS)
-libCbcSolver_la_CPPFLAGS = $(CBCSOLVERLIB_CFLAGS)
 
 ########################################################################
 #                            cbc program                               #
@@ -122,44 +143,10 @@ bin_PROGRAMS += cbc
 cbc_SOURCES = CoinSolve.cpp
 
 # Additional libraries
-cbc_LDADD = libCbcSolver.la libCbc.la
+cbc_LDADD = libCbc.la
 
 # not really accurate to use these CFLAGS, but they should have everything
-cbc_CPPFLAGS = $(CBCSOLVERLIB_CFLAGS)
-
-endif
-
-
-########################################################################
-#                        cbc-generic program                           #
-########################################################################
-
-if CBC_BUILD_CBC_GENERIC
-
-# Name of the executable compiled in this directory.  We want it to be
-# installed in the 'bin' directory
-
-bin_PROGRAMS += cbc-generic
-
-# List all source files for this executable, including headers
-
-cbc_generic_SOURCES = \
-	CbcGenBaB.cpp \
-	CbcGenCbcParam.cpp CbcGenCbcParam.hpp CbcGenCbcParamUtils.cpp \
-	CbcGenCtlBlk.cpp CbcGenCtlBlk.hpp \
-	CbcGeneric.cpp \
-	CbcGenMessages.cpp CbcGenMessages.hpp \
-	CbcGenOsiParam.cpp CbcGenOsiParam.hpp CbcGenOsiParamUtils.cpp \
-	CbcGenParam.cpp CbcGenParam.hpp CbcGenParamUtils.cpp \
-	CbcGenSolution.cpp \
-	CbcGenSolvers.cpp
-
-# List all additionally required solver and Osi libraries
-# the flags for all available LP solvers should have been collected
-# by configure in CBCGENERIC_LFLAGS and CBCGENERIC_CFLAGS
-
-cbc_generic_LDADD = libCbcSolver.la libCbc.la $(CBCGENERIC_LFLAGS)
-cbc_generic_CPPFLAGS = $(CBCGENERIC_CFLAGS)
+cbc_CPPFLAGS = $(CBCLIB_CFLAGS)
 
 endif
 
@@ -200,6 +187,7 @@ includecoin_HEADERS = \
 	CbcCompare.hpp \
 	CbcCountRowCut.hpp \
 	CbcCutGenerator.hpp \
+	CbcCutPoolFilter.hpp \
 	CbcCutModifier.hpp \
 	CbcCutSubsetModifier.hpp \
 	CbcDummyBranchingObject.hpp \
@@ -212,25 +200,33 @@ includecoin_HEADERS = \
 	CbcFullNodeInfo.hpp \
 	CbcGeneral.hpp \
 	CbcGeneralDepth.hpp \
+	CbcGenMessages.hpp \
 	CbcHeuristic.hpp \
+	CbcHeuristicControl.hpp \
 	CbcHeuristicDINS.hpp \
 	CbcHeuristicDive.hpp \
 	CbcHeuristicDiveCoefficient.hpp \
+	CbcHeuristicDiveConfigurable.hpp \
+	CbcDiveScheduler.hpp \
+	CbcRootHeuristicSchedule.hpp \
 	CbcHeuristicDiveFractional.hpp \
 	CbcHeuristicDiveGuided.hpp \
 	CbcHeuristicDiveLineSearch.hpp \
 	CbcHeuristicDivePseudoCost.hpp \
 	CbcHeuristicDiveVectorLength.hpp \
 	CbcHeuristicFPump.hpp \
+	CbcHeuristicFeasibilityJump.hpp \
 	CbcHeuristicGreedy.hpp \
 	CbcHeuristicLocal.hpp \
 	CbcHeuristicPivotAndFix.hpp \
+	CbcHeuristicSppGrasp.hpp \
 	CbcHeuristicRandRound.hpp \
 	CbcHeuristicRENS.hpp \
 	CbcHeuristicRINS.hpp \
 	CbcHeuristicVND.hpp \
 	CbcHeuristicDW.hpp \
 	CbcMessage.hpp \
+	CbcOutput.hpp \
 	CbcModel.hpp \
 	CbcNode.hpp \
 	CbcNodeInfo.hpp \
@@ -239,19 +235,28 @@ includecoin_HEADERS = \
 	CbcObjectUpdateData.hpp \
 	CbcParam.hpp \
 	CbcPartialNodeInfo.hpp \
+	CbcPartialSolutionPool.hpp \
+	CbcParameters.hpp \
 	CbcSimpleInteger.hpp \
 	CbcSimpleIntegerDynamicPseudoCost.hpp \
 	CbcSimpleIntegerPseudoCost.hpp \
 	CbcStrategy.hpp \
 	CbcSolver.hpp \
-	CbcMipStartIO.hpp \
+	CbcSolverCutSetup.hpp \
+	CbcMipStart.hpp \
 	CbcSOS.hpp \
+	CbcPostprocessRepair.hpp \
 	CbcSubProblem.hpp \
 	CbcTree.hpp \
 	CbcLinked.hpp \
 	CbcTreeLocal.hpp \
 	ClpConstraintAmpl.hpp \
-	ClpAmplObjective.hpp 
+	CbcSolverStatistics.hpp \
+	CbcInstanceFeatures.hpp \
+	CbcBoundPropagation.hpp \
+	CbcCoefficientStrengthening.hpp \
+	CbcRowReductions.hpp \
+	ClpAmplObjective.hpp
 
 #######################################################################
 # Create the Config.h file that has all public defines and install it #
@@ -259,7 +264,6 @@ includecoin_HEADERS = \
 
 install-exec-local:
 	$(install_sh_DATA) config_cbc.h $(DESTDIR)$(includecoindir)/CbcConfig.h
-	$(install_sh_DATA) config_cbcsolver.h $(DESTDIR)$(includecoindir)/CbcSolverConfig.h
 
 uninstall-local:
 	rm -f $(DESTDIR)$(includecoindir)/CbcConfig.h $(DESTDIR)$(includecoindir)/CbcSolverConfig.h

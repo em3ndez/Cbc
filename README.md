@@ -2,6 +2,11 @@
 
 [![A COIN-OR Project](https://coin-or.github.io/coin-or-badge.png)](https://www.coin-or.org)
 
+Projects such as this one are maintained by a small group of volunteers under
+the auspices of the non-profit [COIN-OR Foundation](https://www.coin-or.org)
+and we need your help! Please consider [sponsoring our
+activities](https://github.com/sponsors/coin-or) or [volunteering](mailto:volunteer@coin-or.org) to help!
+
 [![Latest Release](https://img.shields.io/github/v/release/coin-or/Cbc?sort=semver)](https://github.com/coin-or/Cbc/releases)
 
 _This file is auto-generated from [config.yml](.coin-or/config.yml) using the 
@@ -38,15 +43,6 @@ It can be used in a wide variety of ways through various modeling systems, packa
    * [OpenSolver for Excel](http://opensolver.org)
    * [OpenSolver for Google Sheets](https://opensolver.org/opensolver-for-google-sheets/)
 
-Binaries for most platforms are available for download from
-[here](https://www.coin-or.org/download/binary/Cbc). AMPL also provides
-stand-alone [Cbc
-executables](http://ampl.com/products/solvers/open-source/#cbc) that can be
-used with (or without) AMPL. Julia provides a wide range of
-[binaries](https://github.com/JuliaBinaryWrappers/Cbc_jll.jl/releases).
-Alternatives include [conda](https://github.com/conda-forge/coin-or-cbc-feedstock) and
-your favorite package manager, as detailed [below](https://github.com/coin-or/Cbc#binaries).
-
 Cbc is developed by John Forrest, now retired from IBM Research, and others.
 The project is currently managed by John Forrest, [Ted
 Ralphs](http://github.com/tkralphs), [Stefan
@@ -55,13 +51,13 @@ Santos](https://github.com/h-g-s), and the rest of the Cbc team.
 
 Cbc is written in C++ and is released as open source under the [Eclipse Public License 2.0](http://www.opensource.org/licenses/EPL-2.0).
 
-It is distributed under the auspices of the [COIN-OR Foundation](https://www.coin-or.org)
+It is distributed under the auspices of the [COIN-OR Foundation](https://www.coin-or.org).
 
 The Cbc development site is https://github.com/coin-or/Cbc.
 
 ## CITE
 
-[![DOI](https://zenodo.org/badge/173509563.svg)](https://zenodo.org/badge/latestdoi/173509563)
+Code: [![DOI](https://zenodo.org/badge/173509563.svg)](https://zenodo.org/badge/latestdoi/173509563)
 
 ## CURRENT BUILD STATUS
 
@@ -71,11 +67,15 @@ The Cbc development site is https://github.com/coin-or/Cbc.
 
 ## DOWNLOAD
 
+What follows is a quick start guide for obtaining or building
+Cbc on common platforms. More detailed information is
+available [here](https://coin-or.github.io/user_introduction.html).
+
 ### Docker image
 
 There is a Docker image that provides Cbc, as well as other projects
 in the [COIN-OR Optimization
-Suite](https://github.com/coin-or/COIN-OR-OptimizationSuite) [here](https://hub.docker.com/repository/docker/coinor/coin-or-optimization-suite)
+Suite](https://github.com/coin-or/COIN-OR-OptimizationSuite) [here](https://hub.docker.com/r/coinor/coin-or-optimization-suite).
 
 ### Binaries
 
@@ -85,35 +85,80 @@ releases in Github
 are archived as part of Cbc
 [here](https://www.coin-or.org/download/binary/Cbc).
 
- * *Linux*: On Debian/Ubuntu, Cbc is available in the package `coinor-cbc` and can be installed with apt. On Fedora, Cbc is available in the package `coin-or-Cbc`.
+ * *Linux* (see https://repology.org/project/coin-or-cbc/versions for a complete listing):
+   * Arch Linux:
+     ```
+     sudo pacman -S coin-or-cbc
+     ```
+   * Debian and Ubuntu:
+     ```
+     sudo apt install coinor-cbc coinor-libcbc-dev
+     ```
+   * Fedora:
+     ```
+     sudo dnf install coin-or-Cbc coin-or-Cbc-devel
+     ```
+ * *FreeBSD*:
+   ```
+   sudo pkg install math/cbc
+   ```
+ * *macOS and Linux*: With [Homebrew](https://brew.sh), from the
+   [COIN-OR tap](https://github.com/coin-or-tools/homebrew-coinor), do
+   ```
+   brew update
+   brew tap coin-or-tools/coinor
+   brew trust coin-or-tools/coinor
+   brew install coin-or-tools/coinor/cbc
+   ```
+   Since version 6.0, Homebrew loads formulas from taps other than its own
+   only if you trust them. `brew trust coin-or-tools/coinor` trusts all
+   formulas of the COIN-OR tap. This is needed because installing a formula by
+   its full name trusts only that formula, not the other formulas of the tap
+   that it depends on. `brew update` makes sure that your Homebrew is recent
+   enough to have the `brew trust` command.
  * *Windows*: The easiest way to get Cbc on Windows is to download an archive as described above.
- * *Mac OS X*: The easiest way to get Cbc on Mac OS X is through [Homebrew](https://brew.sh).
-   * `brew tap coin-or-tools/coinor`
-   * `brew install coin-or-tools/coinor/cbc`
+   With [MSYS2](https://www.msys2.org), in the UCRT64 environment, do
+   ```
+   pacman -S mingw-w64-ucrt-x86_64-coin-or-cbc
+   ```
+ * *conda* (cross-platform):
+   ```
+   conda install -c conda-forge coin-or-cbc
+   ```
 
-Due to license incompatibilities, pre-compiled binaries lack some functionality.
-If binaries are not available for your platform for the latest version and you would like to request them to be built and posted, feel free to let us know on the mailing list.
+Due to license incompatibilities, pre-compiled binaries lack some 
+functionality. If binaries are not available for your platform for the latest 
+version and you would like to request them to be built and posted, feel free 
+to open a discussion on Github. 
 
 ### Source
 
 Source code can be obtained either by
 
  * Downloading a snapshot of the source code for the latest release version of Cbc from the
- [releases](https://github.com/coin-or/Cbc/releases) page.
- * Cloning this repository from [Github](https://github.com/coin-or/Cbc) or 
+ [releases](https://github.com/coin-or/Cbc/releases) page,
+ * Cloning this repository from [Github](https://github.com/coin-or/Cbc), or 
  * Using the [coinbrew](https://github.com/coin-or/coinbrew) script to get the project and all dependencies (recommended, see below).   
 
-Below is a quick start guide for building on common platforms. More detailed
-build instructions are
-[here](https://coin-or.github.io/user_introduction.html).
+### Dependencies
+
+Cbc has a number of dependencies, which are detailed in
+[config.yml](.coin-or/config.yml). Dependencies on other COIN-OR projects are
+automatically downloaded when obtaining the source with `coinbrew`. For some
+of the remaining third-party dependencies, automatic download scripts and
+build wrappers are provided (and will also be automatically run for required
+and recommended dependencies), while other libraries that are easy to obtain
+must be installed using an appropriate package manager (or may come with your
+OS by default). 
 
 ## BUILDING from source
 
-The quick start assumes you are in a bash shell. 
+These quick start instructions assume you are in a bash shell. 
 
 ### Using `coinbrew`
 
-To build Cbc from source, obtain the `coinbrew` script, do
+To download and build Cbc from source, execute the 
+following on the command line. 
 ```
 wget https://raw.githubusercontent.com/coin-or/coinbrew/master/coinbrew
 chmod u+x coinbrew
@@ -127,7 +172,7 @@ The `coinbrew` script will fetch the additional projects specified in the Depend
 
  * Download the source code, e.g., by cloning the git repo https://github.com/coin-or/Cbc
  * Download and install the source code for the dependencies listed in [config.yml](.coin-or/config.yml)
- * Build the code as follows (make sure to set PKG_CONFIG_PTH to install directory for dependencies).
+ * Build the code as follows (make sure to set `PKG_CONFIG_PATH` to the `lib/pkgconfig` directory of the installation of the dependencies).
 
 ```
 ./configure -C
@@ -198,23 +243,24 @@ in the build directory. If Cbc was built via `coinbrew`, then the build
 directory will be `./build/Cbc/master` by default. The doxygen documentation main file
 is found at `<build-dir>/doxydoc/html/index.html`.
 
-If you don't have `doxygen` installed locally, you can use also find the
-documentation [here](http://coin-or.github.io/Cbc/Doxygen).
+If you don't have `doxygen` installed locally, you can also find the
+documentation [here](https://coin-or.github.io/Cbc/Doxygen).
 
 ## DOCUMENTATION
 
  * [User's Guide](https://coin-or.github.io/Cbc) (from 2005)
- * [Doxygen generated documentation](http://www.coin-or.org/Doxygen/Cbc/hierarchy.html)
  * Source code [examples](examples)
- * [Cbc command-line guide](https://projects.coin-or.org/CoinBinary/export/1059/OptimizationSuite/trunk/Installer/files/doc/cbcCommandLine.pdf)
+ * [Cbc command-line guide](https://github.com/coin-or/COIN-OR-OptimizationSuite/raw/master/Installer/files/doc/cbcCommandLine.pdf)
 
 
 ## Project Links
 
- * [COIN-OR Initiative](http://www.coin-or.org/)
- * [Discussion formum](https://github.com/coin-or/Cbc/discussions)
+ * [Code of Conduct](https://www.coin-or.org/code-of-conduct/)
+ * [COIN-OR Web Site](http://www.coin-or.org/)
+ * [COIN-OR general discussion forum](https://github.com/orgs/coin-or/discussions)
+ * [Cbc Discussion forum](https://github.com/coin-or/Cbc/discussions)
  * [Report a bug](https://github.com/coin-or/Cbc/issues/new)
- * [Doxygen-generated html documentation](http://coin-or.github.io/Cbc/Doxygen)
+ * [Doxygen generated documentation](https://coin-or.github.io/Cbc/Doxygen)
 
 ## CHANGELOG
 
@@ -276,8 +322,26 @@ documentation [here](http://coin-or.github.io/Cbc/Doxygen).
           - `oddwext`: strategy used to search for wheel centers for the cuts found by CglOddWheel - 0=off, 1=one variable, 2=clique - default=2.
       - CglClique was replaced by CglBKClique as the default clique separator in CbcSolver.cpp.
 
+ * Release 2.10.10
+   * Fix for accidental introduction of private symbol into public header.
+
+ * Release 2.10.9
+   * Improvements to symmetry handling.
+   * Maintenance release to push out accumulates patches.
+
+ * Release 2.10.8
+   * Re-generate binaries due to mistake in Github Actions configuration and 
+     incorporate new release of Cgl. 
+
+ * Release 2.10.7
+   * Fix a bug that would cause the unit test not to run correctly if the 
+     MIPLIB3 project was not present
+
+ * Release 2.10.6
+   * Accumulated fixes related to build, test, and CI. 
+
  * Release 2.10.5
-   * revert fix that stopped Clp when timelimit reached, as that lead to
+   * Revert fix that stopped Clp when timelimit reached, as that lead to
      all cleanup solves afterwards to stop without proper finishing and
      giving wrong results
 
@@ -287,7 +351,8 @@ documentation [here](http://coin-or.github.io/Cbc/Doxygen).
    * More bugfixes.
 
  * Release 2.10.3
-   * Improve performance of some primal heuristics, incl. feasibility pump, by making integer slacks continuous
+   * Improve performance of some primal heuristics, incl. feasibility pump, 
+     by making integer slacks continuous
    * Added additional timelimit checks
    * Fixed initialization of Cbc_clone result
    * Additional bugfixes
@@ -393,7 +458,7 @@ documentation [here](http://coin-or.github.io/Cbc/Doxygen).
  * Release 2.9.0
 
    * Introduced specialized branching methods for dealing with "big Ms".
-   * Introduced new methods for dealing with symmetry (requires installation of [nauty](http://pallini.di.uniroma1.it/))
+   * Introduced new methods for dealing with symmetry (requires installation of [nauty](https://pallini.di.uniroma1.it/))
    * Introduction of conflict cuts (off by default, turn on with `-constraint conflict`)
 
  * Release 2.8.13
@@ -511,8 +576,7 @@ documentation [here](http://coin-or.github.io/Cbc/Doxygen).
      your command line -GMI root (or other options).
 
      The implementation of these cuts is described in G. Cornuejols, F.
-     Margot, and G. Nannicini "On the safety of Gomory cut generators"
-     http://faculty.sutd.edu.sg/~nannicini/index.php?page=publications
+     Margot, and G. Nannicini "On the safety of Gomory cut generators".
 
    * To encourage the use of some of the more exotic/expensive cut generators
      a parameter -slowcutpasses has been added. The idea is that the code does

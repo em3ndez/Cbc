@@ -9,6 +9,7 @@
 #include "CbcCountRowCut.hpp"
 #include "CbcCompareActual.hpp"
 #include "CbcBranchActual.hpp"
+#include <unordered_set>
 
 #if CBC_DEBUG_HEAP > 0
 
@@ -142,6 +143,9 @@ CbcTree::CbcTree()
   maximumNodeNumber_ = 0;
   numberBranching_ = 0;
   maximumBranching_ = 0;
+  lastObjective_ = 0.0;
+  lastDepth_ = 0;
+  lastUnsatisfied_ = 0;
   branched_ = NULL;
   newBound_ = NULL;
 }
@@ -157,6 +161,9 @@ CbcTree::CbcTree(const CbcTree &rhs)
   maximumNodeNumber_ = rhs.maximumNodeNumber_;
   numberBranching_ = rhs.numberBranching_;
   maximumBranching_ = rhs.maximumBranching_;
+  lastObjective_ = rhs.lastObjective_;
+  lastDepth_ = rhs.lastDepth_;
+  lastUnsatisfied_ = rhs.lastUnsatisfied_;
   if (maximumBranching_ > 0) {
     branched_ = CoinCopyOfArray(rhs.branched_, maximumBranching_);
     newBound_ = CoinCopyOfArray(rhs.newBound_, maximumBranching_);
@@ -172,6 +179,9 @@ CbcTree::operator=(const CbcTree &rhs)
   if (this != &rhs) {
     nodes_ = rhs.nodes_;
     maximumNodeNumber_ = rhs.maximumNodeNumber_;
+    lastObjective_ = rhs.lastObjective_;
+    lastDepth_ = rhs.lastDepth_;
+    lastUnsatisfied_ = rhs.lastUnsatisfied_;
     delete[] branched_;
     delete[] newBound_;
     numberBranching_ = rhs.numberBranching_;
@@ -562,7 +572,7 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
         depth[kDelete] = node->depth();
       }
     } else {
-      bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+      bestPossibleObjective = std::min(bestPossibleObjective, value);
       nodeArray[k++] = node;
     }
   }
@@ -605,6 +615,11 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
       doing more work than needed, modifying the model to match a subproblem
       at a node that will be discarded.  Then again, we seem to need the basis.
     */
+  // Track cuts deleted in this cleanup pass. addCuts1 rebuilds addedCuts_ from
+  // nodeInfo for each node, so a cut freed for an earlier node can reappear as
+  // a stale pointer for a later node. Guard against that use-after-free by
+  // recording every freed pointer and skipping it on subsequent encounters.
+  std::unordered_set< CbcCountRowCut * > deletedCuts;
   for (j = nNodes - 1; j >= kDelete; j--) {
     CbcNode *node = nodeArray[j];
     CoinWarmStartBasis *lastws = (cutoff != -COIN_DBL_MAX) ? model->getEmptyBasis() : NULL;
@@ -620,8 +635,15 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
         // take off node
         CoinWarmStartBasis::Status status = lastws->getArtifStatus(i + model->numberRowsAtContinuous());
         if (status != CoinWarmStartBasis::basic && model->addedCuts()[i]) {
-          if (!model->addedCuts()[i]->decrement(numberLeft))
+          if (deletedCuts.count(model->addedCuts()[i])) {
+            model->addedCuts()[i] = NULL;
+            continue;
+          }
+          if (!model->addedCuts()[i]->decrement(numberLeft)) {
+            deletedCuts.insert(model->addedCuts()[i]);
             delete model->addedCuts()[i];
+            model->addedCuts()[i] = NULL;
+          }
         }
       }
     } else {
@@ -630,8 +652,15 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
         // take off node
         if (model->addedCuts()[i]) {
           if (model->parallelMode() != 1 || true) {
-            if (!model->addedCuts()[i]->decrement(numberLeft))
+            if (deletedCuts.count(model->addedCuts()[i])) {
+              model->addedCuts()[i] = NULL;
+              continue;
+            }
+            if (!model->addedCuts()[i]->decrement(numberLeft)) {
+              deletedCuts.insert(model->addedCuts()[i]);
               delete model->addedCuts()[i];
+              model->addedCuts()[i] = NULL;
+            }
           }
         }
       }
@@ -665,7 +694,7 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
       if (child->node()) {
         double value = child->node()->objectiveValue();
         // adjust
-        bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+        bestPossibleObjective = std::min(bestPossibleObjective, value);
       }
     }
   }
@@ -931,7 +960,7 @@ CbcTreeArray::getBestPossibleObjective()
     }
   }
   if (lastNode_) {
-    bestPossibleObjective = CoinMin(bestPossibleObjective, lastNode_->objectiveValue());
+    bestPossibleObjective = std::min(bestPossibleObjective, lastNode_->objectiveValue());
   }
 #ifdef CBC_THREAD
   if (model->parallelMode() > 0 && model->master()) {
@@ -943,7 +972,7 @@ CbcTreeArray::getBestPossibleObjective()
       if (child->node()) {
         double value = child->node()->objectiveValue();
         // adjust
-        bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+        bestPossibleObjective = std::min(bestPossibleObjective, value);
       }
     }
   }
@@ -991,7 +1020,7 @@ void CbcTreeArray::cleanTree(CbcModel *model, double cutoff, double &bestPossibl
         depth[kDelete] = node->depth();
       }
     } else {
-      bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+      bestPossibleObjective = std::min(bestPossibleObjective, value);
       nodeArray[k++] = node;
     }
   }
@@ -1005,14 +1034,14 @@ void CbcTreeArray::cleanTree(CbcModel *model, double cutoff, double &bestPossibl
       if (child->node()) {
         double value = child->node()->objectiveValue();
         // adjust
-        bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+        bestPossibleObjective = std::min(bestPossibleObjective, value);
       }
     }
   }
 #endif
   if (lastNode_) {
     double value = lastNode_->objectiveValue();
-    bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+    bestPossibleObjective = std::min(bestPossibleObjective, value);
     if (value >= cutoff || !lastNode_->active()) {
       nodeArray[--kDelete] = lastNode_;
       depth[kDelete] = lastNode_->depth();
@@ -1296,7 +1325,7 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
       // double check in case node can change its mind!
       value = node->checkIsCutoff(cutoff);
     }
-    bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+    bestPossibleObjective = std::min(bestPossibleObjective, value);
     if (value >= cutoff) {
       if (node) {
         nodeArray[--kDelete] = node;
@@ -1316,7 +1345,7 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
       if (child->node()) {
         double value = child->node()->objectiveValue();
         // adjust
-        bestPossibleObjective = CoinMin(bestPossibleObjective, value);
+        bestPossibleObjective = std::min(bestPossibleObjective, value);
       }
     }
   }
@@ -1354,7 +1383,32 @@ void CbcTree::cleanTree(CbcModel *model, double cutoff, double &bestPossibleObje
       doing more work than needed, modifying the model to match a subproblem
       at a node that will be discarded.  Then again, we seem to need the basis.
     */
+  /*
+      This loop costs O(depth) per deleted node (addCuts1 walks the node's
+      whole ancestor chain), so a tree holding hundreds of thousands of
+      dominated nodes at real depth can take well over a minute here with no
+      chance for the model to notice its time limit was reached -- this is
+      the only per-node bookkeeping loop in this routine, and it runs
+      infrequently (only when the tree is pruned), so a cheap periodic check
+      does not cost anything on the hot per-node solve path. Once the
+      deadline has passed we already know the search is stopping right after
+      this call returns, so the remaining discarded nodes are freed without
+      the expensive addCuts1 restore: their cuts simply are not released
+      early, which is a bounded, harmless memory cost, not a correctness
+      issue.
+    */
+  const double maximumSeconds = model->getMaximumSeconds();
+  int nodesSinceTimeCheck = 0;
   for (j = nNodes - 1; j >= kDelete; j--) {
+    if (((nodesSinceTimeCheck++ & 255) == 0) && model->getCurrentSeconds() > maximumSeconds) {
+      for (; j >= kDelete; j--) {
+        CbcNode *node = nodeArray[j];
+        if (node->nodeInfo())
+          node->nodeInfo()->throwAway();
+        delete node;
+      }
+      break;
+    }
     CbcNode *node = nodeArray[j];
     CoinWarmStartBasis *lastws = model->getEmptyBasis();
 

@@ -11,8 +11,6 @@
 #include "CbcBranchBase.hpp"
 #include "CbcSubProblem.hpp"
 
-#ifdef CBC_HAS_CLP
-
 /** Define a catch all class.
     This will create a list of subproblems using partial evaluation
 */
@@ -85,10 +83,16 @@ public:
   {
     return nodeInfo_->nodeInfo_[which];
   }
+  /// Get ClpNodeStuff
+  inline ClpNodeStuff *info()
+  {
+    return nodeInfo_;
+  }
 
   /// Redoes data when sequence numbers change
   virtual void redoSequenceEtc(CbcModel *model, int numberColumns, const int *originalColumns);
-
+  /// For orbital branching
+  int orbitalBranching(int sequence, double * upper);
 protected:
   /// data
   /// Maximum depth
@@ -281,7 +285,6 @@ public:
   /// Which one
   int whichOne_;
 };
-#endif //CBC_HAS_CLP
 #endif
 
 /* vi: softtabstop=2 shiftwidth=2 expandtab tabstop=2

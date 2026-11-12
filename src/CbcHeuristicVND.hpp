@@ -31,6 +31,9 @@ public:
   /// Clone
   virtual CbcHeuristic *clone() const;
 
+  /// Classification: improvement heuristic (needs ≥1 solution)
+  virtual HeuristicCategory category() const { return HeuristicCategory::IMPROVEMENT; }
+
   /// Assignment operator
   CbcHeuristicVND &operator=(const CbcHeuristicVND &rhs);
 
@@ -54,6 +57,9 @@ public:
   int solutionFix(double &objectiveValue,
     double *newSolution,
     const int *keep);
+
+  // See CbcHeuristicRINS.hpp -- shouldHeurRun()'s non-Legacy fast path now
+  // lives in the base class, no override needed.
 
   /// Sets how often to do it
   inline void setHowOften(int value)

@@ -128,7 +128,7 @@ int CbcHeuristicRandRound::solution(double &solutionValue,
   OsiSolverInterface *solver = model_->solver()->clone();
   double primalTolerance;
   solver->getDblParam(OsiPrimalTolerance, primalTolerance);
-  OsiClpSolverInterface *clpSolver = dynamic_cast< OsiClpSolverInterface * >(solver);
+  OsiClpSolverInterface *clpSolver = getClpSolver(solver);
   if (!clpSolver) {
     delete solver;
     return 0;

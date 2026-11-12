@@ -5,6 +5,7 @@
 #ifndef CbcThread_H
 #define CbcThread_H
 
+#include <atomic>
 #include "CbcModel.hpp"
 #include "CbcNode.hpp"
 class OsiObject;
@@ -149,12 +150,12 @@ public:
   /// Get return code
   inline int returnCode() const
   {
-    return returnCode_;
+    return returnCode_.load(std::memory_order_acquire);
   }
   /// Set return code
   inline void setReturnCode(int value)
   {
-    returnCode_ = value;
+    returnCode_.store(value, std::memory_order_release);
   }
   /// Get base model
   inline CbcModel *baseModel() const
@@ -169,22 +170,36 @@ public:
   /// Get node
   inline CbcNode *node() const
   {
-    return node_;
+    return node_.load(std::memory_order_acquire);
   }
   /// Set node
   inline void setNode(CbcNode *node)
   {
-    node_ = node;
+    // Snapshot the objective value here (while it is still only touched by
+    // whichever thread currently owns it: the master thread just picked it
+    // off the tree, or this worker just finished processing it) so that
+    // other threads can inspect nodeObjectiveValue() without dereferencing
+    // node_, which may be concurrently mutated/deleted by this worker while
+    // it processes the node (see CbcModel::branchAndBound's periodic
+    // printing, which used to read child->node()->objectiveValue()).
+    nodeObjectiveValue_.store(node ? node->objectiveValue() : COIN_DBL_MAX,
+      std::memory_order_release);
+    node_.store(node, std::memory_order_release);
+  }
+  /// Get snapshot of node's objective value (safe to call cross-thread)
+  inline double nodeObjectiveValue() const
+  {
+    return nodeObjectiveValue_.load(std::memory_order_acquire);
   }
   /// Get created node
   inline CbcNode *createdNode() const
   {
-    return createdNode_;
+    return createdNode_.load(std::memory_order_acquire);
   }
   /// Set created node
   inline void setCreatedNode(CbcNode *node)
   {
-    createdNode_ = node;
+    createdNode_.store(node, std::memory_order_release);
   }
   /// Get dantzig state
   inline int dantzigState() const
@@ -199,42 +214,50 @@ public:
   /// Get time in thread
   inline double timeInThread() const
   {
-    return timeInThread_;
+    return timeInThread_.load(std::memory_order_relaxed);
   }
   /// Increment time in thread
   inline void incrementTimeInThread(double value)
   {
-    timeInThread_ += value;
+    double old = timeInThread_.load(std::memory_order_relaxed);
+    while (!timeInThread_.compare_exchange_weak(old, old + value, std::memory_order_relaxed))
+      ;
   }
   /// Get time waiting to start
   inline double timeWaitingToStart() const
   {
-    return timeWaitingToStart_;
+    return timeWaitingToStart_.load(std::memory_order_relaxed);
   }
   /// Increment time waiting to start
   inline void incrementTimeWaitingToStart(double value)
   {
-    timeWaitingToStart_ += value;
+    double old = timeWaitingToStart_.load(std::memory_order_relaxed);
+    while (!timeWaitingToStart_.compare_exchange_weak(old, old + value, std::memory_order_relaxed))
+      ;
   }
   /// Get time locked
   inline double timeLocked() const
   {
-    return timeLocked_;
+    return timeLocked_.load(std::memory_order_relaxed);
   }
   /// Increment time locked
   inline void incrementTimeLocked(double value)
   {
-    timeLocked_ += value;
+    double old = timeLocked_.load(std::memory_order_relaxed);
+    while (!timeLocked_.compare_exchange_weak(old, old + value, std::memory_order_relaxed))
+      ;
   }
   /// Get time waiting to lock
   inline double timeWaitingToLock() const
   {
-    return timeWaitingToLock_;
+    return timeWaitingToLock_.load(std::memory_order_relaxed);
   }
   /// Increment time waiting to lock
   inline void incrementTimeWaitingToLock(double value)
   {
-    timeWaitingToLock_ += value;
+    double old = timeWaitingToLock_.load(std::memory_order_relaxed);
+    while (!timeWaitingToLock_.compare_exchange_weak(old, old + value, std::memory_order_relaxed))
+      ;
   }
   /// Get if deterministic
   inline int deterministic() const
@@ -312,6 +335,16 @@ public:
   {
     iterationsThisTime_ = value;
   }
+  /// Get number of strong iterations this time
+  inline int strongIterationsThisTime() const
+  {
+    return strongIterationsThisTime_;
+  }
+  /// Set number of strong iterations this time
+  inline void setStrongIterationsThisTime(int value)
+  {
+    strongIterationsThisTime_ = value;
+  }
   /// Get save stuff array
   inline int *saveStuff()
   {
@@ -327,14 +360,18 @@ public: // private:
   CbcSpecificThread threadStuff_;
   CbcModel *baseModel_;
   CbcModel *thisModel_;
-  CbcNode *node_; // filled in every time
-  CbcNode *createdNode_; // filled in every time on return
+  std::atomic<CbcNode *> node_; // filled in every time
+  // Snapshot of node_'s objective value, updated alongside node_ (see
+  // setNode()/nodeObjectiveValue()) so other threads can inspect it without
+  // dereferencing node_ itself.
+  std::atomic<double> nodeObjectiveValue_;
+  std::atomic<CbcNode *> createdNode_; // filled in every time on return
   CbcThread *master_; // points back to master thread
-  int returnCode_; // -1 available, 0 busy, 1 finished , 2??
-  double timeLocked_;
-  double timeWaitingToLock_;
-  double timeWaitingToStart_;
-  double timeInThread_;
+  std::atomic<int> returnCode_; // -1 available, 0 busy, 1 finished , 2??
+  std::atomic<double> timeLocked_;
+  std::atomic<double> timeWaitingToLock_;
+  std::atomic<double> timeWaitingToStart_;
+  std::atomic<double> timeInThread_;
   double timeWhenLocked_; // time when thread got lock (in seconds)
   int numberTimesLocked_;
   int numberTimesUnlocked_;
@@ -347,6 +384,7 @@ public: // private:
   int maxDeleteNode_;
   int nodesThisTime_;
   int iterationsThisTime_;
+  int strongIterationsThisTime_;
   int deterministic_;
 #ifdef THREAD_DEBUG
 public:
@@ -395,6 +433,8 @@ public:
 
   /// Split model and do work in deterministic parallel
   void deterministicParallel();
+  /// Split model and do work in deterministic parallel using fathomMany
+  void deterministicParallel(CbcNode ** nodes);
   /**
        Locks a thread if parallel so that stuff like cut pool
        can be updated and/or used.
@@ -455,8 +495,14 @@ private:
   int numberObjects_;
   OsiObject **saveObjects_;
   int threadStats_[6];
+  int numberThreadsWaiting_;
+  int numberThreadsDone_;
+  int numberThreadsUsed_;
   int defaultParallelIterations_;
   int defaultParallelNodes_;
+  int numberGeneralBranches_;
+  int totalGeneralNodes_;
+  int totalGeneralIterations_;
 };
 #else
 // Dummy threads
@@ -468,6 +514,8 @@ public:
   CbcThread() {}
 
   virtual ~CbcThread() {}
+
+  inline void setNode(CbcNode *) {}
 };
 /** Base model */
 

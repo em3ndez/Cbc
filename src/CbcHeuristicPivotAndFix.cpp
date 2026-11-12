@@ -84,7 +84,7 @@ int CbcHeuristicPivotAndFix::solution(double & /*solutionValue*/,
 {
 
   numCouldRun_++; // Todo: Ask JJHF what this for.
-  std::cout << "Entering Pivot-and-Fix Heuristic" << std::endl;
+  //std::cout << "Entering Pivot-and-Fix Heuristic" << std::endl;
 
 #ifdef HEURISTIC_INFORM
   printf("Entering heuristic %s - nRuns %d numCould %d when %d\n",
@@ -105,7 +105,7 @@ int CbcHeuristicPivotAndFix::solution(double & /*solutionValue*/,
   double start = CoinCpuTime();
 
   OsiClpSolverInterface *clpSolverOriginal
-    = dynamic_cast< OsiClpSolverInterface * >(model_->solver());
+    = getClpSolver(model_->solver());
   assert(clpSolverOriginal);
   OsiClpSolverInterface *clpSolver(clpSolverOriginal);
 

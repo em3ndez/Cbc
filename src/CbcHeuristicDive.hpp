@@ -5,7 +5,9 @@
 #ifndef CbcHeuristicDive_H
 #define CbcHeuristicDive_H
 
+#include <atomic>
 #include "CbcHeuristic.hpp"
+#include "OsiCuts.hpp"
 class CbcSubProblem;
 class OsiRowCut;
 struct PseudoReducedCost {
@@ -113,6 +115,18 @@ public:
     maxTime_ = value;
   }
 
+  /// Aggressive mode: lift limits when no incumbent exists (replaces diveopt 8)
+  void setAggressiveMode(bool value) { aggressiveMode_ = value; }
+  bool aggressiveMode() const { return aggressiveMode_; }
+
+  /// Adaptive fixing: reduce percentageToFix_ after infeasible dives
+  void setAdaptiveFixing(bool value) { adaptiveFixing_ = value; }
+  bool adaptiveFixing() const { return adaptiveFixing_; }
+
+  /// Fix general integers at non-bound values (replaces maxIterations_%10 hack)
+  void setFixGeneralIntegers(bool value) { fixGeneralIntegers_ = value; }
+  bool fixGeneralIntegers() const { return fixGeneralIntegers_; }
+
   /// Tests if the heuristic can run
   virtual bool canHeuristicRun();
 
@@ -190,6 +204,73 @@ protected:
 
   // Maximum number of simplex iterations at root node
   int maxSimplexIterationsAtRoot_;
+
+  // diveopt 8: track consecutive infeasible dives to adapt percentageToFix_
+  int numConsecutiveInfeasible_;
+
+  // Last run statistics (populated after solution() returns)
+  int lastDiveIterations_;
+  int lastSimplexIterations_;
+  int lastReasonToStop_;
+
+  // Conflict cuts discovered during diving (collected when collectConflicts_ is true)
+  OsiCuts conflictCuts_;
+  bool collectConflicts_;
+  int maxConflictSize_; // max number of fixings to consider as a conflict
+  double minConflictViolation_;
+
+public:
+  int lastDiveIterations() const { return lastDiveIterations_; }
+  int lastSimplexIterations() const { return lastSimplexIterations_; }
+  int lastReasonToStop() const { return lastReasonToStop_; }
+
+  void setCollectConflicts(bool v, int maxSize = 10, double minViol = 0.05) {
+    collectConflicts_ = v; maxConflictSize_ = maxSize; minConflictViolation_ = minViol;
+  }
+  const OsiCuts &conflictCuts() const { return conflictCuts_; }
+  void clearConflictCuts() { conflictCuts_ = OsiCuts(); }
+
+  // --- Explicit flags replacing magic number encodings ---
+
+  /// When true, lift iteration/simplex limits when no incumbent exists.
+  /// Replaces the "when_ % 100 == 8" magic encoding.
+  bool aggressiveMode_;
+
+  /// When true, adaptively reduce percentageToFix_ after consecutive
+  /// infeasible dives. Replaces the "when_ % 100 == 8" adaptive logic.
+  bool adaptiveFixing_;
+
+  /// When true, also fix general integer variables that are at a
+  /// non-bound integer value. Replaces "maxIterations_ % 10" encoding.
+  bool fixGeneralIntegers_;
+
+  /// External abort flag for parallel cancellation (nullptr = disabled).
+  /// When pointed-to value becomes true, the dive exits at next iteration.
+  const std::atomic<bool> *abortFlag_;
+
+  // --- Objective-guided diving (FPump-style) ---
+
+  /// 0=off, 1=binary only, 2=binary+general integer
+  int guidedObjMode_;
+  /// Strength of guidance objective coefficient
+  double guidedObjWeight_;
+  /// Blend weight for original objective (0=pure guidance, 1=pure original)
+  double guidedObjOrigWeight_;
+  /// Number of pure-guidance LP resolves before first fix
+  int guidedObjWarmup_;
+  /// Apply guidance every N iterations (1=every iter)
+  int guidedObjFrequency_;
+
+public:
+  /// Set external abort flag (for parallel scheduler)
+  void setAbortFlag(const std::atomic<bool> *flag) { abortFlag_ = flag; }
+
+  // Guided objective setters
+  void setGuidedObjMode(int v) { guidedObjMode_ = v; }
+  void setGuidedObjWeight(double v) { guidedObjWeight_ = v; }
+  void setGuidedObjOrigWeight(double v) { guidedObjOrigWeight_ = v; }
+  void setGuidedObjWarmup(int v) { guidedObjWarmup_ = v; }
+  void setGuidedObjFrequency(int v) { guidedObjFrequency_ = v; }
 };
 #endif
 

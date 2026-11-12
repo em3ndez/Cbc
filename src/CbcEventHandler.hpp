@@ -49,7 +49,7 @@
 #include <map>
 
 #include "CbcConfig.h"
-
+#include "CbcOutput.hpp"
 /* May well already be declared, but can't hurt. */
 
 class CbcModel;
@@ -107,7 +107,18 @@ public:
     /*! Having generated cuts, allows user to think. */
     generatedCuts,
     /*! End of search. */
-    endSearch
+    endSearch,
+    /*! Setting up handler. */
+    startUp,
+    /*! Just before starting branching i.e. after root cuts. */
+    afterRootCuts,
+    /*! Search progress. Fired, always on the base model's handler and never
+        concurrently, when the incumbent improves, when the global dual bound
+        improves significantly (see -progressMinChange), and as a heartbeat
+        (source "tick") when neither has happened for about a second. It is
+        informational: the action returned is ignored. Read the snapshot with
+        model->progressInfo(). */
+    progress
   };
 
   /*! \brief Action codes returned by the event handler.
@@ -130,8 +141,9 @@ public:
     /*! Pretend solution never happened. */
     killSolution,
     /*! Take action on modified data. */
-    takeAction
-
+    takeAction,
+    /// end of search - so we update some stuff
+    endOfSearch
   };
 
   /*! \brief Data type for event/action pairs */
@@ -217,6 +229,20 @@ public:
     }
     (*eaMap_)[event] = action;
   }
+  
+  /*! \brief Set optional bnb output handler (NULL disables output statistics). */
+
+  inline void setOutputHandler(CbcBnBOutput * outputHandler)
+  {
+    bnbHandler_ = outputHandler;
+  }
+
+  /*! \brief Get bnb output handler */
+
+  inline CbcBnBOutput * getOutputHandler() const
+  {
+    return bnbHandler_;
+  }
 
   //@}
 
@@ -234,6 +260,10 @@ protected:
   /*! \brief Default action */
 
   CbcAction dfltAction_;
+
+  /*! \brief pointer to BnBhandler */
+
+  CbcBnBOutput * bnbHandler_;
 
   /*! \brief Pointer to a map that holds non-default event/action pairs */
 

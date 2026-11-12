@@ -12,11 +12,7 @@
 #include <cmath>
 #include <cfloat>
 
-#ifdef CBC_HAS_CLP
 #include "OsiClpSolverInterface.hpp"
-#else
-#include "OsiSolverInterface.hpp"
-#endif
 //#define CGL_DEBUG 1
 #ifdef CGL_DEBUG
 #include "OsiRowCutDebugger.hpp"
@@ -26,10 +22,24 @@
 #include "CbcCutGenerator.hpp"
 #include "CbcBranchDynamic.hpp"
 #include "CglProbing.hpp"
+#include "CglGomory.hpp"
+#include "CglTwomir.hpp"
+#include "CglMixedIntegerRounding2.hpp"
+#include "CglGMI.hpp"
+#include "CglLandP.hpp"
+#include "CglRedSplit2.hpp"
+// CglMixedIntegerRounding2.hpp unconditionally #define's CGL_DEBUG 0 (its own
+// internal debug switch) if not already defined -- undo that here so it
+// doesn't spuriously enable this file's own `#ifdef CGL_DEBUG` blocks, which
+// assume CGL_DEBUG is only ever defined via this file's own (commented-out)
+// `#define CGL_DEBUG 1` above and expect OsiRowCutDebugger.hpp to have been
+// included in that case.
+#undef CGL_DEBUG
 #include "CglCliqueStrengthening.hpp"
 #include "CglBKClique.hpp"
 #include "CglOddWheel.hpp"
 #include "CoinTime.hpp"
+#include "CbcCutPoolFilter.hpp"
 #ifdef CBC_THREAD
 // need time on a thread by thread basis
 #include <pthread.h>
@@ -56,6 +66,10 @@ CbcCutGenerator::CbcCutGenerator()
   , numberCutsAtRoot_(0)
   , numberActiveCutsAtRoot_(0)
   , numberShortCutsAtRoot_(0)
+  , numberConsecutiveMisses_(0)
+  , nextRetryPass_(0)
+  , retryPeriod_(0)
+  , rootCallPeriod_(0)
   , switches_(1)
   , maximumTries_(-1)
 {
@@ -79,6 +93,10 @@ CbcCutGenerator::CbcCutGenerator(CbcModel *model, CglCutGenerator *generator,
   , numberCutsAtRoot_(0)
   , numberActiveCutsAtRoot_(0)
   , numberShortCutsAtRoot_(0)
+  , numberConsecutiveMisses_(0)
+  , nextRetryPass_(0)
+  , retryPeriod_(0)
+  , rootCallPeriod_(0)
   , switches_(1)
   , maximumTries_(-1)
 {
@@ -130,6 +148,10 @@ CbcCutGenerator::CbcCutGenerator(const CbcCutGenerator &rhs)
   numberCutsAtRoot_ = rhs.numberCutsAtRoot_;
   numberActiveCutsAtRoot_ = rhs.numberActiveCutsAtRoot_;
   numberShortCutsAtRoot_ = rhs.numberShortCutsAtRoot_;
+  numberConsecutiveMisses_ = rhs.numberConsecutiveMisses_;
+  nextRetryPass_ = rhs.nextRetryPass_;
+  retryPeriod_ = rhs.retryPeriod_;
+  rootCallPeriod_ = rhs.rootCallPeriod_;
 }
 
 // Assignment operator
@@ -161,6 +183,10 @@ CbcCutGenerator::operator=(const CbcCutGenerator &rhs)
     numberCutsAtRoot_ = rhs.numberCutsAtRoot_;
     numberActiveCutsAtRoot_ = rhs.numberActiveCutsAtRoot_;
     numberShortCutsAtRoot_ = rhs.numberShortCutsAtRoot_;
+    numberConsecutiveMisses_ = rhs.numberConsecutiveMisses_;
+    nextRetryPass_ = rhs.nextRetryPass_;
+    retryPeriod_ = rhs.retryPeriod_;
+    rootCallPeriod_ = rhs.rootCallPeriod_;
   }
   return *this;
 }
@@ -209,9 +235,13 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       howOften = 1; // do anyway
     }
   }
-  if (howOften == -100)
+  if (howOften <= -100 || howOften == 0)
     return false;
   int pass = model_->getCurrentPassNumber() - 1;
+  const bool rootCadence = !node && !model_->parentModel()
+    && !model_->getNodeCount() && rootCallPeriod_ > 0;
+  if (rootCadence && pass >= 0 && pass % rootCallPeriod_)
+    return false;
   if (maximumTries_ > 0) {
     // howOften means what it says
     if ((pass % howOften) != 0 || depth)
@@ -259,20 +289,21 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
   if (howOften == 100)
     doThis = false;
   // Switch off if special setting
-  if (whenCutGeneratorInSub_ == -200 && model_->parentModel()) {
+  if (whenCutGeneratorInSub_ == -200 && !model_->inSmallBranchAndBound()) {
     fullScan = 0;
     doThis = false;
   }
   if (fullScan || doThis) {
+    if (rootCadence && model_->logLevel() > 1)
+      printf("[root-cadence] generator=%s pass=%d period=%d\n",
+        generatorName_, pass + 1, rootCallPeriod_);
     CoinThreadRandom *randomNumberGenerator = NULL;
-#ifdef CBC_HAS_CLP
     {
       OsiClpSolverInterface *clpSolver
-        = dynamic_cast< OsiClpSolverInterface * >(solver);
+        = getClpSolver(solver);
       if (clpSolver)
         randomNumberGenerator = clpSolver->getModelPtr()->randomNumberGenerator();
     }
-#endif
     double time1 = 0.0;
     //#undef CBC_THREAD
     /* TODO there should be check in configure or the Posix version C preprocessor variable
@@ -286,6 +317,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
     clockid_t threadClockId;
     if (timing()) {
       if (!model_->getNumberThreads()) {
+	// If elapsed time used - is this correct? - but who cares.
 	time1 = CoinCpuTime();
       } else {
 	// Get thread clock Id
@@ -300,6 +332,14 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
     //#define CBC_DEBUG
     int numberRowCutsBefore = cs.sizeRowCuts();
     int numberColumnCutsBefore = cs.sizeColCuts();
+#ifdef CGL_DEBUG
+    const OsiRowCutDebugger *debugger2 = solver->getRowCutDebugger();
+    if (debugger2 && debugger2->onOptimalPath(*solver)) {
+      printf("On optimal path cbcgen\n");
+    } else {
+      debugger2 = NULL;
+    }
+#endif
 #ifdef JJF_ZERO
     int cutsBefore = cs.sizeCuts();
 #endif
@@ -341,6 +381,18 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       // Pass across model information in case it could be useful
       //void * saveData = solver->getApplicationData();
       //solver->setApplicationData(model_);
+      // Propagate remaining wall-clock time so cut generators can self-limit.
+      // Previously root-only (!depth): but a single cut-generation pass at
+      // any depth can be expensive and uninterruptible (e.g. CglRedSplit2
+      // on irish-electricity ran ~39s unconstrained at the root because it
+      // never saw this budget). getMaximumSeconds()<1.0e6 already gates
+      // this to only when a real -sec limit is active, so the extra
+      // CoinCpuTime() call below only fires on time-bounded runs.
+      if (model_->getMaximumSeconds()<1.0e6) {
+        double remaining = model_->getMaximumSeconds() - model_->getCurrentSeconds();
+        if (remaining > 0.0 && remaining <5.0e7)
+          generator_->setMaxSeconds(remaining);
+      }
       generator_->generateCuts(*solver, cs, info);
       //solver->setApplicationData(saveData);
     } else {
@@ -364,6 +416,28 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
         info2->originalColumns = model_->originalColumns();
         info2->randomNumberGenerator = randomNumberGenerator;
         generator->generateCutsAndModify(*solver, cs, info2);
+#if CGL_DEBUG
+	int numberRowCutsAfter = cs.sizeRowCuts();
+	for (int k = 0; k < numberRowCutsAfter; k++) {
+	  OsiRowCut thisCut = cs.rowCut(k);
+	  printf("cut from %s has bounds %.10g and %.10g\n",
+		 generatorName_, thisCut.lb(), thisCut.ub());
+	  if (thisCut.lb() <= thisCut.ub() && false) {
+	    /* check size of elements.
+	       We can allow smaller but this helps debug generators as it
+	       is unsafe to have small elements */
+	    int n = thisCut.row().getNumElements();
+	    const int *column = thisCut.row().getIndices();
+	    const double *element = thisCut.row().getElements();
+	    assert(n);
+	    for (int i = 0; i < n; i++) {
+	      double value = element[i];
+	      //	      if (fabs(value) <= 1.0e-12 || fabs(value) >= 1.0e20)
+	      //nBad++;
+	    }
+	  }
+	}
+#endif
         doCuts = true;
       } else if (depth) {
         /* The idea behind this is that probing may work in a different
@@ -373,7 +447,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
 #define TRY_NOW_AND_THEN
 #ifdef TRY_NOW_AND_THEN
         if ((numberTimes_ == 200 || (numberTimes_ > 200 && (numberTimes_ % 2000) == 0))
-          && !model_->parentModel() && info.formulation_rows > 200) {
+          && !model_->inSmallBranchAndBound() && info.formulation_rows > 200) {
           /* In tree, every now and then try various combinations
                        maxStack, maxProbe (last 5 digits)
                        123 is special and means CglProbing will try and
@@ -448,8 +522,10 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
         }
 #endif
         if (generator->getMaxLook() > 0 && !doCuts) {
-          generator->generateCutsAndModify(*solver, cs, &info);
-          doCuts = true;
+	  if (info.level<4||(info.level&2)==0) {
+	    generator->generateCutsAndModify(*solver, cs, &info);
+	    doCuts = true;
+	  }
         }
       } else {
         // at root - don't always do
@@ -494,6 +570,24 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
         if ((model_->getThreadMode() & 2) == 0) {
           for (j = 0; j < numberColumns; j++) {
             if (solver->isInteger(j)) {
+              // Only trust CglProbing's tightLower()/tightUpper() for BINARY
+              // variables. These arrays come from CglProbing's internal
+              // tighten() Big-M row-propagation, which is already known (see
+              // CglProbing.cpp's skipGenIntColCuts, added after the nu25-pr12
+              // WRONG_OBJ investigation) to sometimes cascade an incorrect
+              // bound onto GENERAL-INTEGER variables. skipGenIntColCuts only
+              // stops CglProbing from emitting an explicit OsiColCut for
+              // those columns -- it does NOT protect this separate direct
+              // application of tightLower()/tightUpper() straight onto the
+              // solver, which bypasses the cuts framework (and therefore
+              // every cut-validity check) entirely. Applying an unsound
+              // general-integer bound this way was root-caused to be exactly
+              // how column C5865 on nu25-pr12 got wrongly fixed away from
+              // its true-optimal value, producing a wrong (too high on a
+              // minimization) reported objective.
+              bool isBinary = (upper[j] - lower[j] <= 1.0 + 1.0e-8) && lower[j] >= -1.0e-8 && upper[j] <= 1.0 + 1.0e-8;
+              if (!isBinary)
+                continue;
               if (tightUpper[j] < upper[j]) {
                 double nearest = floor(tightUpper[j] + 0.5);
                 //assert (fabs(tightUpper[j]-nearest)<1.0e-5); may be infeasible
@@ -519,8 +613,8 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
                   if (tightLower[j] > solution[j] + primalTolerance || tightUpper[j] < solution[j] - primalTolerance)
                     returnCode = true;
                 } else if (tightenBounds && tightenBounds[j]) {
-                  solver->setColLower(j, CoinMax(tightLower[j], lower[j]));
-                  solver->setColUpper(j, CoinMin(tightUpper[j], upper[j]));
+                  solver->setColLower(j, std::max(tightLower[j], lower[j]));
+                  solver->setColUpper(j, std::min(tightUpper[j], upper[j]));
                   if (tightLower[j] > solution[j] + primalTolerance || tightUpper[j] < solution[j] - primalTolerance)
                     returnCode = true;
                 }
@@ -563,8 +657,8 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
                   if (tightLower[j] > solution[j] + primalTolerance || tightUpper[j] < solution[j] - primalTolerance)
                     ifCut = true;
                 } else if (tightenBounds && tightenBounds[j]) {
-                  lbs.insert(j, CoinMax(tightLower[j], lower[j]));
-                  ubs.insert(j, CoinMin(tightUpper[j], upper[j]));
+                  lbs.insert(j, std::max(tightLower[j], lower[j]));
+                  ubs.insert(j, std::min(tightUpper[j], upper[j]));
                   if (tightLower[j] > solution[j] + primalTolerance || tightUpper[j] < solution[j] - primalTolerance)
                     ifCut = true;
                 }
@@ -599,13 +693,11 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       //returnCode=true;
       if (!returnCode) {
         // bounds changed but still optimal
-#ifdef CBC_HAS_CLP
         OsiClpSolverInterface *clpSolver
-          = dynamic_cast< OsiClpSolverInterface * >(solver);
+          = getClpSolver(solver);
         if (clpSolver) {
           clpSolver->setLastAlgorithm(2);
         }
-#endif
       }
 #ifdef JJF_ZERO
       // Pass across info to pseudocosts
@@ -629,6 +721,119 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       delete[] mark;
 #endif
     }
+
+    // Post-generation cut-pool filtering: these generators can flood
+    // a single round with many redundant/dominated cuts (same rationale
+    // as CglBKClique's own CoinCutPool-based clique-cut filtering, see
+    // insertCuts() there). Applies to both root and in-tree rounds; gated
+    // off for small models/candidate counts inside cbcFilterGeneratedCuts()
+    // itself. Only affects cuts appended by *this* generateCuts() call
+    // (numberRowCutsBefore..cs.sizeRowCuts()). GMI/LandP/RedSplit2 added
+    // 2026-09 alongside the boundStallAware() round-skip -- that mechanism
+    // only decides *whether* a generator fires again next pass, it does
+    // nothing to cap how many cuts a single productive round emits, which
+    // is exactly the gap this filter closes for them too.
+    if (dynamic_cast< CglGomory * >(generator_)
+      || dynamic_cast< CglMixedIntegerRounding2 * >(generator_)
+      || dynamic_cast< CglTwomir * >(generator_)
+      || dynamic_cast< CglGMI * >(generator_)
+      || dynamic_cast< CglLandP * >(generator_)
+      || dynamic_cast< CglRedSplit2 * >(generator_)
+      || generator) {
+      CbcCutPoolFilterSettings filter = model_->cutPoolFilterSettings();
+      if (node || model_->parentModel() || model_->getNodeCount())
+        filter.scoreMode = 0;
+      if (filter.rootScope != 1 || node || model_->parentModel() || model_->getNodeCount())
+        cbcFilterGeneratedCuts(cs, numberRowCutsBefore, solver->getColSolution(),
+          solver->getNumCols(), solver->getNumElements(), generatorName_,
+          filter);
+    }
+#ifdef CGL_DEBUG
+    if (debugger2) {
+      int numberRowCutsAfter = cs.sizeRowCuts();
+      for (int k = numberRowCutsAfter - 1; k >= numberRowCutsBefore; k--) {
+        OsiRowCut &thisCut = cs.rowCut(k);
+	if (debugger2->invalidCut(thisCut)) {
+	  // check solver is valid
+	  OsiSolverInterface * temp = solver->clone();
+	  temp->resolve();
+	  int numberColumns = temp->getNumCols();
+	  const double * solution = solver->getColSolution();
+	  const double * solution2 = temp->getColSolution();
+	  for (int i=0;i<numberColumns;i++) {
+	    if (fabs(solution[i]-solution2[i])>1.0e-5) {
+	      printf("first mismatch on solution %d %g and %g\n",i,
+		     solution[i],solution2[i]);
+	      break;
+	    }
+	  }
+	  const double *solutionO = debugger2->optimalSolution();
+	  const double *lower = temp->getColLower();
+	  const double *upper = temp->getColUpper();
+	  int numberRows = temp->getNumRows();
+	  int nCont = model_->continuousSolver()->getNumRows();
+	  const CoinPackedMatrix *rowCopy = temp->getMatrixByRow();
+	  const int *column = rowCopy->getIndices();
+	  const int *rowLength = rowCopy->getVectorLengths();
+	  const CoinBigIndex *rowStart = rowCopy->getVectorStarts();
+	  const double *rowLower = temp->getRowLower();
+	  const double *rowUpper = temp->getRowUpper();
+	  const double *element = rowCopy->getElements();
+	  for (int i=nCont;i<numberRows;i++) {
+	    double sum = 0.0;
+	    for (CoinBigIndex j=rowStart[i];j<rowStart[i]+rowLength[i];j++) {
+	      int iColumn = column[j];
+	      sum += element[j]*solutionO[iColumn];
+	    }
+	    if (sum<rowLower[i]-1.0e-4 || sum>rowUpper[i]+1.0e-4)
+	      printf("bad row %d %g <= %g <= %g\n",
+		     i,rowLower[i],sum,rowUpper[i]);
+	  }
+	  for (int i = 0; i < numberColumns; i++) {
+	    if (temp->isInteger(i)) {
+	      double value = floor(solutionO[i] + 0.5);
+	      assert(value >= lower[i] && value <= upper[i]);
+	      temp->setColLower(i, value);
+	      temp->setColUpper(i, value);
+	    }
+	  }
+	  temp->resolve();
+	  assert (temp->isProvenOptimal());
+	  delete temp;
+	  abort();
+	}
+      }
+    }
+#endif
+    //#define CBC_CLEAN_CUTS
+#ifdef CBC_CLEAN_CUTS
+    // take out ones with small elements
+    {
+      int numberRowCutsAfter = cs.sizeRowCuts();
+      for (int k = numberRowCutsAfter - 1; k >= numberRowCutsBefore; k--) {
+        OsiRowCut &thisCut = cs.rowCut(k);
+	CoinPackedVector rpv = thisCut.row();
+	const int n = rpv.getNumElements();
+	const int *indices = rpv.getIndices();
+	const double *elements = rpv.getElements();
+	double tolerance = 2.0*model_->getIntegerTolerance();
+	bool bad = false;
+	double badValue=0.0;
+	for (int i=0;i<n;i++) {
+	  if (fabs(elements[i])<tolerance&&solver->isInteger(indices[i])) {
+	    bad = true;
+	    badValue = elements[i];
+	    break;
+	  }
+	}
+        if (bad) {
+	  cs.eraseRowCut(k);
+	  printf("bad cut %s with %d elements - %g\n",
+		 generatorName_,n,badValue);
+	}
+      }
+    }
+#endif
     CbcCutModifier *modifier = model_->cutModifier();
     if (modifier) {
       int numberRowCutsAfter = cs.sizeRowCuts();
@@ -661,7 +866,40 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       const double *upper = solver->getColUpper();
       const double *solution = solver->getColSolution();
 #endif
-      for (k = numberRowCutsBefore; k < numberRowCutsAfter; k++) {
+#define ADJUST_CUTS 1
+#ifdef ADJUST_CUTS
+      const double * solution = solver->getColSolution();
+      const double *colUpper = solver->getColUpper();
+      const double *colLower = solver->getColLower();
+      double smallValue1; // = 1.0e-4;
+      double smallValue2; // = 1.0e-5;
+      double largeRatio = 1.0e9;
+      if (!depth) {
+	smallValue1 = 1.0e-5;
+	smallValue2 = 1.0e-5;
+      } else {
+	smallValue1 = 1.0e-4;
+	smallValue2 = 1.0e-4;
+      }
+      //largeRatio = 1.0e8;
+      // Leave the cuts alone if some branching objects come from another
+      // solver (e.g., Couenne's spatial branching): its relaxation relies
+      // on cuts that are only slightly violated.
+      const bool adjustCuts = !model_->hasNonCbcObjects();
+#define ALLOW_INEFFECTIVE
+#ifdef ALLOW_INEFFECTIVE
+      // allow ineffective cuts at root
+      bool allowIneffective = false;
+      if (!depth) {
+	if (strstr(generatorName_,"Probing")||
+	    strstr(generatorName_,"Knapsack")||
+	    strstr(generatorName_,"Clique")||
+	    strstr(generatorName_,"OddWheel"))
+	  allowIneffective = true;
+      }
+#endif
+#endif
+      for (k = numberRowCutsAfter - 1; k >= numberRowCutsBefore; k--) {
         OsiRowCut *thisCut = cs.rowCutPtr(k);
 #ifdef WEAKEN_CUTS
         // weaken cut if coefficients not integer
@@ -686,10 +924,10 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
               integral = false;
             if (solver->isInteger(column)) {
               nInteger++;
-              double largerBound = CoinMax(fabs(lower[column]),
+              double largerBound = std::max(fabs(lower[column]),
                 fabs(upper[column]));
               double solutionBound = fabs(solution[column]) + 10.0;
-              bound += CoinMin(largerBound, solutionBound);
+              bound += std::min(largerBound, solutionBound);
             }
           }
 #if WEAKEN_CUTS == 1
@@ -728,7 +966,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
           }
           // is it nearly violated
           if (sum > ub - 1.0e-8 || sum < lb + 1.0e-8) {
-            double violation = CoinMax(sum - ub, lb - sum);
+            double violation = std::max(sum - ub, lb - sum);
             std::cout << generatorName_ << " cut with " << n
                       << " coefficients, nearly cuts off known solutions by " << violation
                       << ", lo=" << lb << ", ub=" << ub << std::endl;
@@ -759,6 +997,118 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
         }
 #endif
         thisCut->mutableRow().setTestForDuplicateIndex(false);
+#ifdef ADJUST_CUTS
+	if (adjustCuts) {
+	  CoinPackedVector rpv = thisCut->row();
+	  int n = rpv.getNumElements();
+	  int *indices = rpv.getIndices();
+	  double *elements = rpv.getElements();
+	  double rlo = thisCut->lb();
+	  double rup = thisCut->ub();
+	  bool upper;
+	  double rhs;
+	  if (rup < 1.0e20) {
+	    upper = true;
+	    rhs = rup;
+	    // for now
+	    if (rlo>-1.0e20)
+	      continue;
+	  } else {
+	    upper = false;
+	    rhs = rlo;
+	  }
+	  double largest=0.0;
+	  double smallest=1.0e30;
+	  bool bad=false;
+	  double sum = 0.0;
+	  double origRhs = rhs;
+	  int number = 0;
+	  for (int i=0;i<n;i++) {
+	    double value=elements[i];
+	    int iColumn = indices[i];
+	    sum += value*solution[iColumn];
+	  }
+	  if (fabs(sum-rhs)<smallValue1) {
+#ifdef ALLOW_INEFFECTIVE
+	    if (!allowIneffective)
+#endif
+	    bad = true; // could be dangerous cut
+	  }
+	  double tolerance = smallValue1;//std::max(smallValue1,fabs(sum)*0.0001*smallValue1);
+	  if (upper && sum < rhs+tolerance) {
+#ifdef ALLOW_INEFFECTIVE
+	    if (!allowIneffective)
+#endif
+	    bad = true; //continue;
+	  } else if(!upper &&sum > rhs-tolerance) {
+#ifdef ALLOW_INEFFECTIVE
+	    if (!allowIneffective)
+#endif
+	    bad = true; //continue; // not doing much good?
+	  }
+	  for (int i=0;i<n;i++) {
+	    double value=fabs(elements[i]);
+	    if (value<smallValue2) { // was 1.0e-9
+	      int iColumn = indices[i];
+	      if (colUpper[iColumn]-colLower[iColumn]<100.0) {
+		// weaken cut
+		if (upper) {
+		  if (elements[i]>0.0) 
+		    rhs -= value*colLower[iColumn];
+		  else
+		    rhs += value*colUpper[iColumn];
+		  if (sum < rhs+smallValue1) {
+		    // throw away
+		    bad=true;
+		    break;
+		  }
+		} else {
+		  if (elements[i]>0.0) 
+		    rhs -= value*colUpper[iColumn];
+		  else
+		    rhs += value*colLower[iColumn];
+		  if (sum > rhs-smallValue1) {
+		    // throw away
+		    bad=true;
+		    break;
+		  }
+		}
+	      } else {
+		// throw away
+		bad=true;
+		break;
+	      }
+	    } else {
+	      int iColumn = indices[i];
+	      largest=std::max(largest,value);
+	      smallest=std::min(smallest,value);
+	      indices[number]=indices[i];
+	      elements[number++]=elements[i];
+	    }
+	  }
+	  if (rhs!=origRhs) {
+	    double weaken = fabs(rhs-origRhs);
+#if 0
+	    if (!bad && largest <= largeRatio*smallest) {
+	      if (upper)
+		printf("weakening upper on cut from %.10g to %.10g\n",
+		       origRhs,origRhs+weaken);
+	      else
+		printf("weakening lower on cut from %.10g to %.10g\n",
+		       origRhs,origRhs-weaken);
+	    }
+#endif
+	    if (upper)
+	      thisCut->setUb(origRhs+weaken);
+	    else
+	      thisCut->setLb(origRhs-weaken);
+	  }
+	  if (bad || largest > largeRatio*smallest) {
+	    // safer to throw away
+	    cs.eraseRowCut(k);
+	  }
+	}
+#endif
       }
     }
     // Add in saved cuts if violated
@@ -797,7 +1147,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       int nEls = 0;
       int nCuts = numberRowCutsAfter - numberRowCutsBefore;
       // Remove NULL cuts!
-      int nNull = 0;
+      //int nNull = 0;
       const double *solution = solver->getColSolution();
       bool feasible = true;
       double primalTolerance = 1.0e-7;
@@ -828,7 +1178,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
           } else {
             sum = 0.0;
             cs.eraseRowCut(k);
-            nNull++;
+            //nNull++;
           }
         }
       }
@@ -853,18 +1203,18 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       CoinBigIndex nAdd;
       CoinBigIndex nAdd2;
       CoinBigIndex nReasonable;
-      if (!model_->parentModel() && depth < 2) {
+      if (!model_->inSmallBranchAndBound() && depth < 2) {
         if (inaccuracy_ < 3) {
           nAdd = 10000;
           if (pass > 0 && numberColumns > -500)
-            nAdd = CoinMin(nAdd, nElsNow + 2 * numberRows);
+            nAdd = std::min(nAdd, nElsNow + 2 * numberRows);
         } else {
           nAdd = 10000;
           if (pass > 0)
-            nAdd = CoinMin(nAdd, nElsNow + 2 * numberRows);
+            nAdd = std::min(nAdd, nElsNow + 2 * numberRows);
         }
         nAdd2 = 5 * numberColumns;
-        nReasonable = CoinMax(nAdd2, nElsNow / 8 + nAdd);
+        nReasonable = std::max(nAdd2, nElsNow / 8 + nAdd);
         if (!depth && !pass) {
           // allow more
           nAdd += nElsNow / 2;
@@ -876,14 +1226,14 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
       } else {
         nAdd = 200;
         nAdd2 = 2 * numberColumns;
-        nReasonable = CoinMax(nAdd2, nElsNow / 8 + nAdd);
+        nReasonable = std::max(nAdd2, nElsNow / 8 + nAdd);
       }
       //#define UNS_WEIGHT 0.1
 #ifdef UNS_WEIGHT
       const double *colLower = solver->getColLower();
       const double *colUpper = solver->getColUpper();
 #endif
-      if (/*nEls>CoinMax(nAdd2,nElsNow/8+nAdd)*/ nCuts && feasible) {
+      if (/*nEls>std::max(nAdd2,nElsNow/8+nAdd)*/ nCuts && feasible) {
         //printf("need to remove cuts\n");
         // just add most effective
 #ifndef JJF_ONE
@@ -968,7 +1318,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
 #ifdef USE_OBJECTIVE
             if (sum) {
 #if USE_OBJECTIVE == 1
-              obj = CoinMax(1.0e-6, fabs(obj));
+              obj = std::max(1.0e-6, fabs(obj));
               norm = sqrt(obj * norm);
               //sum += fabs(obj)*invObjNorm;
               //printf("sum %g norm %g normobj %g invNorm %g mod %g\n",
@@ -1002,7 +1352,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
         }
         CoinSort_2(sort, sort + nCuts, which);
         // Now see which ones are too similar
-        int nParallel = 0;
+        //int nParallel = 0;
         double testValue = (depth > 1) ? 0.99 : 0.999999;
         for (k = 0; k < nCuts; k++) {
           int j = which[k];
@@ -1021,7 +1371,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
             element2[column[i]] = value;
             norm += value * value;
           }
-          int kkk = CoinMin(nCuts, k + 5);
+          int kkk = std::min(nCuts, k + 5);
           for (int kk = k + 1; kk < kkk; kk++) {
             int jj = which[kk];
             const OsiRowCut *thisCut2 = cs.rowCutPtr(jj);
@@ -1045,16 +1395,16 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
               if ((lb < -1.0e20 && lbB > -1.0e20) || (lbB < -1.0e20 && lb > -1.0e20))
                 parallel = false;
               double tolerance;
-              tolerance = CoinMax(fabs(lb), fabs(lbB)) + 1.0e-6;
+              tolerance = std::max(fabs(lb), fabs(lbB)) + 1.0e-6;
               if (fabs(lb - lbB) > tolerance)
                 parallel = false;
               if ((ub > 1.0e20 && ubB < 1.0e20) || (ubB > 1.0e20 && ub < 1.0e20))
                 parallel = false;
-              tolerance = CoinMax(fabs(ub), fabs(ubB)) + 1.0e-6;
+              tolerance = std::max(fabs(ub), fabs(ubB)) + 1.0e-6;
               if (fabs(ub - ubB) > tolerance)
                 parallel = false;
               if (parallel) {
-                nParallel++;
+                //nParallel++;
                 sort[k] = 0.0;
                 break;
               }
@@ -1207,7 +1557,7 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
             }
             double orthoScore = 1.0 - product * normNew * normB;
             if (orthoScore >= testValue) {
-              ortho[k] = CoinMin(orthoScore, ortho[k]);
+              ortho[k] = std::min(orthoScore, ortho[k]);
               double test = score[k] + ortho[k];
               if (test > best) {
                 best = score[k];
@@ -1322,6 +1672,430 @@ bool CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface
   }
   return returnCode;
 }
+#ifdef CBC_LAGRANGEAN_SOLVERS
+#include "CglGomory.hpp"
+#include "CglTwomir.hpp"
+// create a lagrangean solver
+static OsiClpSolverInterface * lagrangeanSolver(OsiSolverInterface *solver,
+						OsiSolverInterface *baseSolver,
+						int &typeGenerate) {
+  if (solver->getNumRows()==baseSolver->getNumRows()) { 
+    typeGenerate=-1;
+    return new OsiClpSolverInterface();
+  }
+  // create
+  OsiSolverInterface *lagrangeanSolver = baseSolver->clone();
+  OsiClpSolverInterface * clpSolver = getClpSolver(lagrangeanSolver);
+  ClpSimplex * simplex = clpSolver->getModelPtr();
+  int numberOriginalRows = simplex->numberRows(); 
+  int numberRows = solver->getNumRows();
+  int numberColumns = solver->getNumCols();
+  // bounds
+  memcpy(simplex->columnLower(),
+	 solver->getColLower(),numberColumns*sizeof(double));
+  memcpy(simplex->columnUpper(),
+	 solver->getColUpper(),numberColumns*sizeof(double));
+  double * obj = simplex->objective();
+  const double * pi = solver->getRowPrice();
+  const CoinPackedMatrix * rowCopy = solver->getMatrixByRow();
+  const int * column = rowCopy->getIndices();
+  const CoinBigIndex * rowStart = rowCopy->getVectorStarts();
+  const int * rowLength = rowCopy->getVectorLengths(); 
+  const double * rowElements = rowCopy->getElements();
+  const double * rowLower = solver->getRowLower();
+  const double * rowUpper = solver->getRowUpper();
+  int numberCopy = 0;
+  int numberAdd = 0;
+  double * rowLower2 = NULL;
+  double * rowUpper2 = NULL;
+  int * column2 = NULL;
+  CoinBigIndex * rowStart2 = NULL;
+  double * rowElements2 = NULL;
+  char * copy = new char [numberRows-numberOriginalRows];
+  memset(copy,0,numberRows-numberOriginalRows);
+  if (typeGenerate==2) {
+    for (int iRow=numberOriginalRows;iRow<numberRows;iRow++) {
+      bool simple = true;
+      for (CoinBigIndex k=rowStart[iRow];
+	   k<rowStart[iRow]+rowLength[iRow];k++) {
+	double value = rowElements[k];
+	if (value!=floor(value+0.5)) {
+	  simple=false;
+	  break;
+	}
+      }
+      if (simple) {
+	numberCopy++;
+	numberAdd+=rowLength[iRow];
+	copy[iRow-numberOriginalRows]=1;
+      }
+    }
+  }
+  if (numberCopy) {
+    rowLower2 = new double [numberCopy];
+    rowUpper2 = new double [numberCopy];
+    rowStart2 = new CoinBigIndex [numberCopy+1];
+    rowStart2[0]=0;
+    column2 = new int [numberAdd];
+    rowElements2 = new double [numberAdd];
+  } else {
+    // just need base - skip other
+    typeGenerate = -typeGenerate;
+  }
+  numberCopy=0;
+  numberAdd=0;
+  const double * rowSolution = solver->getRowActivity();
+  double offset=0.0;
+  for (int iRow=numberOriginalRows;iRow<numberRows;iRow++) {
+    if (!copy[iRow-numberOriginalRows]) {
+      double value = pi[iRow];
+      offset += rowSolution[iRow]*value;
+      for (CoinBigIndex k=rowStart[iRow];
+	   k<rowStart[iRow]+rowLength[iRow];k++) {
+	int iColumn=column[k];
+	obj[iColumn] -= value*rowElements[k];
+      }
+    } else {
+      rowLower2[numberCopy]=rowLower[iRow];
+      rowUpper2[numberCopy]=rowUpper[iRow];
+      for (CoinBigIndex k=rowStart[iRow];
+	   k<rowStart[iRow]+rowLength[iRow];k++) {
+	column2[numberAdd]=column[k];
+	rowElements2[numberAdd++]=rowElements[k];
+      }
+      numberCopy++;
+      rowStart2[numberCopy]=numberAdd;
+    }
+  }
+  if (numberCopy) {
+    clpSolver->addRows(numberCopy,
+		       rowStart2,column2,rowElements2,
+		       rowLower2,rowUpper2);
+    delete [] rowLower2 ;
+    delete [] rowUpper2 ;
+    delete [] column2 ;
+    delete [] rowStart2 ;
+    delete [] rowElements2 ;
+  }
+  delete [] copy;
+  memcpy(simplex->primalColumnSolution(),solver->getColSolution(),
+	 numberColumns*sizeof(double));
+  CoinWarmStart * warmstart = solver->getWarmStart();
+  CoinWarmStartBasis* warm =
+    dynamic_cast<CoinWarmStartBasis*>(warmstart);
+  warm->resize(numberOriginalRows,numberColumns);
+  clpSolver->setBasis(*warm);
+  delete warm;
+  simplex->setDualObjectiveLimit(COIN_DBL_MAX);
+  simplex->setObjectiveOffset(simplex->objectiveOffset()-offset);
+  simplex->setLogLevel(0);
+  simplex->primal(1);
+  // check basis
+  int numberTotal=simplex->numberRows()+simplex->numberColumns();
+  int superbasic=0;
+  for (int i=0;i<numberTotal;i++) {
+    if (simplex->getStatus(i)==ClpSimplex::superBasic)
+      superbasic++;
+  }
+  if (superbasic) {
+    //printf("%d superbasic!\n",superbasic);
+    simplex->dual();
+    superbasic=0;
+    for (int i=0;i<numberTotal;i++) {
+      if (simplex->getStatus(i)==ClpSimplex::superBasic)
+	superbasic++;
+    }
+    assert (!superbasic);
+  }
+  if (!simplex->status()) {
+    clpSolver->setWarmStart(NULL);
+    clpSolver->setLastAlgorithm(2);
+    return clpSolver;
+  } else {
+    typeGenerate=-1;
+    return new OsiClpSolverInterface();
+  }
+}
+bool
+CbcCutGenerator::generateCuts(OsiCuts &cs, int fullScan, OsiSolverInterface *solver,
+			      CbcNode *node,
+			      OsiSolverInterface **baseSolver,
+			      OsiSolverInterface **cleanSolver)
+{
+  if (node)
+    return generateCuts(cs, fullScan, solver, node);
+  bool returnCode = false;
+  OsiSolverInterface *baseLagrangeanSolver =
+    *baseSolver;
+  OsiSolverInterface *cleanLagrangeanSolver =
+    *cleanSolver;
+  int nCutsBefore = cs.sizeRowCuts();
+#if 0
+  //returnCode = generateCuts(cs, fullScan, solver, node);
+  if (!returnCode && whatLagrangean() &&
+      solver->getNumRows()>model_->continuousSolver()->getNumRows()) {
+    int typeGenerate;
+    if (whatLagrangean()&2) {
+      if (!cleanLagrangeanSolver) {
+	typeGenerate = 2;
+	cleanLagrangeanSolver =
+	  lagrangeanSolver(solver,model_->continuousSolver(),typeGenerate);
+	*cleanSolver = cleanLagrangeanSolver;
+	if (cleanLagrangeanSolver->getNumRows()==
+	    model_->continuousSolver()->getNumRows()) {
+	  // fake base to skip
+	  if (!baseLagrangeanSolver) {
+	    baseLagrangeanSolver = new OsiClpSolverInterface();
+	    *baseSolver = baseLagrangeanSolver;
+	  }
+	}
+      }
+      returnCode = generateCuts(cs, fullScan, cleanLagrangeanSolver, node);
+      //int nCutsAfter = cs.sizeRowCuts();
+      //if (nCutsAfter>nCutsBefore)
+      //printf("clean %s added %d\n",generatorName_,nCutsAfter-nCutsBefore);
+    }
+    if (whatLagrangean()&4) {
+      if (!baseLagrangeanSolver) {
+	typeGenerate = 1;
+	baseLagrangeanSolver =
+	  lagrangeanSolver(solver,model_->continuousSolver(),typeGenerate);
+	*baseSolver = baseLagrangeanSolver;
+      }
+      if (baseLagrangeanSolver->getNumRows()) {
+	returnCode = generateCuts(cs, fullScan, baseLagrangeanSolver, node);
+	//int nCutsAfter = cs.sizeRowCuts();
+	//if (nCutsAfter>nCutsBefore)
+	//printf("base %s added %d\n",generatorName_,nCutsAfter-nCutsBefore);
+      }
+    }
+  }
+  *baseSolver = baseLagrangeanSolver;
+  *cleanSolver = cleanLagrangeanSolver;
+  return returnCode;
+#endif
+  /*
+    If wants base -
+    if base empty - create base from originalSolver_ as in generator
+    set flags to say don't want base and pass in base as solver
+    Same for clean
+   */
+  if (!cleanLagrangean() && !originalLagrangean()) {
+    returnCode = generateCuts(cs, fullScan, solver, node);
+  } else {
+    // 0 - skip, 1 - do normal, 2 - do clean, 3 - do base
+    int typeGenerate = cleanLagrangean() ? 3 : 2;
+    // later take out code from Cgl?
+    // also move originalSolver_ so only one copy (use continuousSolver_)
+    CglGomory * gomory = dynamic_cast<CglGomory *>(generator_);
+    CglTwomir * twomir = dynamic_cast<CglTwomir *>(generator_);
+    OsiSolverInterface * originalSolver;
+    int saveType;
+    if (gomory) {
+      originalSolver = gomory->swapOriginalSolver(NULL);
+      saveType = gomory->gomoryType();
+      gomory->setGomoryType(0);
+    } else if (twomir) {
+      originalSolver = twomir->swapOriginalSolver(NULL);
+      saveType = twomir->twomirType();
+      twomir->setTwomirType(0);
+    }
+    if (solver->getNumRows()==model_->continuousSolver()->getNumRows()) 
+      typeGenerate = 1;
+    // but skip if already done
+    if (typeGenerate==2 && cleanLagrangeanSolver) {
+      returnCode = generateCuts(cs, fullScan, cleanLagrangeanSolver, node);
+    } else if (typeGenerate==3 && baseLagrangeanSolver) {
+      returnCode = generateCuts(cs, fullScan, baseLagrangeanSolver, node);
+    } else if (typeGenerate==1) {
+      returnCode = generateCuts(cs, fullScan, solver, node);
+    } else {
+      // create
+#if 1
+      OsiClpSolverInterface * clpSolver =
+	lagrangeanSolver(solver,model_->continuousSolver(),
+			 typeGenerate);
+      if (typeGenerate == 2) { 
+	cleanLagrangeanSolver = clpSolver;
+	*cleanSolver = cleanLagrangeanSolver;
+      } else {
+	baseLagrangeanSolver = clpSolver;
+	*baseSolver = baseLagrangeanSolver;
+      }
+      if (typeGenerate) {
+	clpSolver->resolve();
+	returnCode = generateCuts(cs, fullScan, clpSolver, node);
+	//int nCutsAfter = cs.sizeRowCuts();
+	//if (nCutsAfter>nCutsBefore)
+	//printf("clean/base %s added %d zgen %d\n",
+	//	 generatorName_,nCutsAfter-nCutsBefore,typeGenerate);
+      }
+    }
+#else
+      OsiClpSolverInterface * clpSolver;
+      if (typeGenerate==2) {
+	cleanLagrangeanSolver = model_->continuousSolver()->clone();
+	clpSolver = getClpSolver(cleanLagrangeanSolver);
+	*cleanSolver = cleanLagrangeanSolver;
+      } else {
+	baseLagrangeanSolver = model_->continuousSolver()->clone();
+	*baseSolver = baseLagrangeanSolver;
+	clpSolver = getClpSolver(baseLagrangeanSolver);
+      }
+      ClpSimplex * simplex = clpSolver->getModelPtr();
+      int numberOriginalRows = simplex->numberRows();
+      int numberRows = solver->getNumRows();
+      int numberColumns = solver->getNumCols();
+      // bounds
+      memcpy(simplex->columnLower(),
+	     solver->getColLower(),numberColumns*sizeof(double));
+      memcpy(simplex->columnUpper(),
+	     solver->getColUpper(),numberColumns*sizeof(double));
+      double * obj = simplex->objective();
+      //objective = CoinCopyOfArray(obj,numberColumns);
+      const double * pi = solver->getRowPrice();
+      const CoinPackedMatrix * rowCopy = solver->getMatrixByRow();
+      const int * column = rowCopy->getIndices();
+      const CoinBigIndex * rowStart = rowCopy->getVectorStarts();
+      const int * rowLength = rowCopy->getVectorLengths(); 
+      const double * rowElements = rowCopy->getElements();
+      const double * rowLower = solver->getRowLower();
+      const double * rowUpper = solver->getRowUpper();
+      int numberCopy = 0;
+      int numberAdd = 0;
+      double * rowLower2 = NULL;
+      double * rowUpper2 = NULL;
+      int * column2 = NULL;
+      CoinBigIndex * rowStart2 = NULL;
+      double * rowElements2 = NULL;
+      char * copy = new char [numberRows-numberOriginalRows];
+      memset(copy,0,numberRows-numberOriginalRows);
+      if (typeGenerate==2) {
+	for (int iRow=numberOriginalRows;iRow<numberRows;iRow++) {
+	  bool simple = true;
+	  for (CoinBigIndex k=rowStart[iRow];
+	       k<rowStart[iRow]+rowLength[iRow];k++) {
+	    double value = rowElements[k];
+	    if (value!=floor(value+0.5)) {
+	      simple=false;
+	      break;
+	    }
+	  }
+	  if (simple) {
+	    numberCopy++;
+	    numberAdd+=rowLength[iRow];
+	    copy[iRow-numberOriginalRows]=1;
+	  }
+	}
+      }
+      if (numberCopy) {
+	rowLower2 = new double [numberCopy];
+	rowUpper2 = new double [numberCopy];
+	rowStart2 = new CoinBigIndex [numberCopy+1];
+	rowStart2[0]=0;
+	column2 = new int [numberAdd];
+	rowElements2 = new double [numberAdd];
+      } else {
+	// just need base - skip other
+	// not quite right as assumes all cut generators have same 1/2
+	if (typeGenerate==1&&cleanLagrangeanSolver)
+	  typeGenerate = 0;
+	else if (typeGenerate==2&&baseLagrangeanSolver)
+	  typeGenerate = 0;
+      }
+      if (typeGenerate) {
+	numberCopy=0;
+	numberAdd=0;
+	const double * rowSolution = solver->getRowActivity();
+	double offset=0.0;
+	for (int iRow=numberOriginalRows;iRow<numberRows;iRow++) {
+	  if (!copy[iRow-numberOriginalRows]) {
+	    double value = pi[iRow];
+	    offset += rowSolution[iRow]*value;
+	    for (CoinBigIndex k=rowStart[iRow];
+		 k<rowStart[iRow]+rowLength[iRow];k++) {
+	      int iColumn=column[k];
+	      obj[iColumn] -= value*rowElements[k];
+	    }
+	  } else {
+	    rowLower2[numberCopy]=rowLower[iRow];
+	    rowUpper2[numberCopy]=rowUpper[iRow];
+	    for (CoinBigIndex k=rowStart[iRow];
+		 k<rowStart[iRow]+rowLength[iRow];k++) {
+	      column2[numberAdd]=column[k];
+	      rowElements2[numberAdd++]=rowElements[k];
+	    }
+	    numberCopy++;
+	    rowStart2[numberCopy]=numberAdd;
+	  }
+	}
+	if (numberCopy) {
+	  clpSolver->addRows(numberCopy,
+			     rowStart2,column2,rowElements2,
+			     rowLower2,rowUpper2);
+	  delete [] rowLower2 ;
+	  delete [] rowUpper2 ;
+	  delete [] column2 ;
+	  delete [] rowStart2 ;
+	  delete [] rowElements2 ;
+	}
+	delete [] copy;
+	simplex->setObjectiveOffset(simplex->objectiveOffset()-offset);
+	memcpy(simplex->primalColumnSolution(),solver->getColSolution(),
+	       numberColumns*sizeof(double));
+	CoinWarmStart * warmstart = solver->getWarmStart();
+	CoinWarmStartBasis* warm =
+	  dynamic_cast<CoinWarmStartBasis*>(warmstart);
+	warm->resize(numberOriginalRows,numberColumns);
+        clpSolver->setBasis(*warm);
+	delete warm;
+	simplex->setDualObjectiveLimit(COIN_DBL_MAX);
+	simplex->setLogLevel(0);
+	simplex->primal(1);
+	// check basis
+	int numberTotal=simplex->numberRows()+simplex->numberColumns();
+	int superbasic=0;
+	for (int i=0;i<numberTotal;i++) {
+	  if (simplex->getStatus(i)==ClpSimplex::superBasic)
+	    superbasic++;
+	}
+	if (superbasic) {
+	  //printf("%d superbasic!\n",superbasic);
+	  simplex->dual();
+	  superbasic=0;
+	  for (int i=0;i<numberTotal;i++) {
+	    if (simplex->getStatus(i)==ClpSimplex::superBasic)
+	      superbasic++;
+	  }
+	  assert (!superbasic);
+	}
+	if (!simplex->status()) {
+	  clpSolver->setWarmStart(NULL);
+	} else {
+	  //printf("BAD status %d\n",simplex->status());
+	  //clpSolver->writeMps("clp");
+	  //solver->writeMps("si");
+	  typeGenerate=0;
+	}
+      } else {
+	delete [] copy;
+      }
+      if (typeGenerate) {
+	returnCode = generateCuts(cs, fullScan, clpSolver, node);
+      }
+    }
+#endif
+    if (gomory) {
+      gomory->swapOriginalSolver(originalSolver);
+      gomory->setGomoryType(saveType);
+    } else if (twomir) {
+      twomir->swapOriginalSolver(originalSolver);
+      twomir->setTwomirType(saveType);
+    }
+  }
+  return returnCode;
+}
+#endif
 void CbcCutGenerator::setHowOften(int howOften)
 {
 
@@ -1388,6 +2162,233 @@ void CbcCutGenerator::scaleBackStatistics(int factor)
   // Number of short cuts at root
   numberShortCutsAtRoot_ = (numberShortCutsAtRoot_ + factor - 1) / factor;
 }
+#ifdef CBC_LAGRANGEAN_SOLVERS
+#include "CglLandP.hpp"
+#include "CglGMI.hpp"
+#include "CglRedSplit2.hpp"
+#include "CglResidualCapacity.hpp"
+#include "OsiRowCutDebugger.hpp"
+// less used cut generators
+// One last (or first) go at cuts
+int
+CbcModel::oneLastGoAtCuts(OsiCuts &cuts, int typeGo)
+{
+  // Get clean solver
+  int typeGenerate = 2; // clean
+  bool doCut[4]={1,1,1,1};
+  {
+    int nNodes = 2000010; //getMaximumNodes();
+    if (nNodes>=2000000 && nNodes<2000050)
+      typeGenerate = 3; // base
+    if ((nNodes>=1000000&&nNodes<1000033) ||
+	(nNodes>=2000000&&nNodes<2000033)) {
+      nNodes %= 100;
+      for (int i=0;i<4;i++) {
+	doCut[i] = nNodes&1;
+	nNodes = nNodes >> 1;
+      }
+    }
+    solver_->resolve();
+  }
+  OsiClpSolverInterface *lSolver;
+  if (typeGo==2) {
+    lSolver = lagrangeanSolver(solver_,continuousSolver_,typeGenerate);
+  } else {
+    lSolver = getClpSolver(solver_);
+  }
+  // cuts seem to dislike a pointer
+  OsiClpSolverInterface solver = *lSolver;
+  if (typeGo==2) 
+    delete lSolver;
+  if (!solver.getNumRows()) {
+    return 0;
+  }
+  solver.setLastAlgorithm(2);// as copy sets to 0
+  solver.getModelPtr()->setProblemStatus(0);
+  int numberColCutsBefore = cuts.sizeColCuts();
+  int numberCutsBefore = cuts.sizeRowCuts();
+  CglTreeInfo info;
+  info.level = 0;
+  info.pass = 0;
+  info.formulation_rows = numberRowsAtContinuous();
+  info.inTree = false;
+#ifdef TIME_LAST_GO
+  int numberCuts = numberCutsBefore;
+  double time1 = CoinCpuTime();
+  double time2 = time1;
+  double time3;
+#endif
+#if 0
+  // less used
+  bool alreadyThere;
+  // CglLandP
+  alreadyThere = false;
+  for (int i = 0; i < numberCutGenerators_; i++) {
+    if (dynamic_cast<CglLandP *>(generator_[i]->generator())) { 
+      alreadyThere = true;
+      break;
+    }
+  }
+  if (!alreadyThere && doCut[0]) {
+    CglLandP generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglLandP generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  // CglGMI
+  alreadyThere = false;
+  for (int i = 0; i < numberCutGenerators_; i++) {
+    if (dynamic_cast<CglGMI *>(generator_[i]->generator())) { 
+      alreadyThere = true;
+      break;
+    }
+  }
+  if (!alreadyThere && doCut[1]) {
+    CglGMI generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglGMI generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  // CglRedSplit2
+  alreadyThere = false;
+  for (int i = 0; i < numberCutGenerators_; i++) {
+    if (dynamic_cast<CglRedSplit2 *>(generator_[i]->generator())) { 
+      alreadyThere = true;
+      break;
+    }
+  }
+  if (!alreadyThere && doCut[2]) {
+    CglRedSplit2 generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglRedSplit2 generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  // CglResidualCapacity
+  alreadyThere = false;
+  for (int i = 0; i < numberCutGenerators_; i++) {
+    if (dynamic_cast<CglResidualCapacity *>(generator_[i]->generator())) { 
+      alreadyThere = true;
+      break;
+    }
+  }
+  if (!alreadyThere && doCut[3]) {
+    CglResidualCapacity generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglResidualCapacity generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  // and now others
+  for (int i = 0; i < numberCutGenerators_; i++) {
+    generator_[i]->generateCuts(cuts,1,&solver,NULL);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    if (nCuts>numberCuts) {
+      printf("%s generated %d cuts %.6f*\n",generator_[i]->cutGeneratorName(),
+	     nCuts-numberCuts,time3-time2);
+      numberCuts = nCuts;
+    } else if (time3>time2+0.01) {
+      printf("%s generated no cuts %.6f*\n",generator_[i]->cutGeneratorName(),
+	     time3-time2);
+    }
+    time2 = time3;
+#endif
+  }
+#else
+  if (typeGo==1) {
+    // see if there
+    for (int i = 0; i < numberCutGenerators_; i++) {
+      if (dynamic_cast<CglLandP *>(generator_[i]->generator()))  
+	doCut[0] = 0;
+      else if (dynamic_cast<CglGMI *>(generator_[i]->generator()))  
+	doCut[1] = 0;
+      else if (dynamic_cast<CglRedSplit2 *>(generator_[i]->generator()))  
+	doCut[2] = 0;
+      else if (dynamic_cast<CglResidualCapacity *>(generator_[i]->generator())) 
+	doCut[3] = 0;
+    }
+  }
+  if (doCut[0]) {
+    CglLandP generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglLandP generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  if (doCut[1]) {
+    CglGMI generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglGMI generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  if (doCut[2]) {
+    CglRedSplit2 generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglRedSplit2 generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+  if (doCut[3]) {
+    CglResidualCapacity generator;
+    generator.generateCuts(solver,cuts,info);
+#ifdef TIME_LAST_GO
+    int nCuts = cuts.sizeRowCuts();
+    time3 = CoinCpuTime();
+    printf("CglResidualCapacity generated %d cuts %.6f\n",
+	   nCuts-numberCuts,time3-time2);
+    time2 = time3;
+    numberCuts = nCuts;
+#endif
+  }
+#endif
+#ifdef TIME_LAST_GO
+  printf("Total cuts %d in time %.6f\n",numberCuts-numberCutsBefore,time2-time1);
+#else
+  int numberCuts = cuts.sizeRowCuts();
+#endif
+  return numberCuts-numberCutsBefore;
+}
+#endif
 // Create C++ lines to get to current state
 void CbcCutGenerator::generateTuning(FILE *fp)
 {
@@ -1411,6 +2412,3 @@ void CbcCutGenerator::generateTuning(FILE *fp)
   if (whetherToUse())
     fprintf(fp, "   generator->setWhetherToUse(true);\n");
 }
-
-/* vi: softtabstop=2 shiftwidth=2 expandtab tabstop=2
-*/

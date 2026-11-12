@@ -11,6 +11,7 @@
 
 #include "CbcConfig.h"
 
+#include <atomic>
 #include <string>
 //#define CBC_DEBUG 1
 //#define CHECK_CUT_COUNTS
@@ -37,11 +38,8 @@
 #include "CbcCountRowCut.hpp"
 #include "CbcFeasibilityBase.hpp"
 #include "CbcMessage.hpp"
-#ifdef CBC_HAS_CLP
 #include "OsiClpSolverInterface.hpp"
 #include "ClpSimplexOther.hpp"
-#endif
-using namespace std;
 #include "CglCutGenerator.hpp"
 #include "CbcNodeInfo.hpp"
 
@@ -110,7 +108,7 @@ CbcNodeInfo::CbcNodeInfo(CbcNodeInfo *parent)
 
 // Copy Constructor
 CbcNodeInfo::CbcNodeInfo(const CbcNodeInfo &rhs)
-  : numberPointingToThis_(rhs.numberPointingToThis_)
+  : numberPointingToThis_(rhs.numberPointingToThis_.load(std::memory_order_relaxed))
   , parent_(rhs.parent_)
   , parentBranch_(NULL)
   , owner_(rhs.owner_)
@@ -130,10 +128,12 @@ CbcNodeInfo::CbcNodeInfo(const CbcNodeInfo &rhs)
     for (int i = 0; i < numberCuts_; i++) {
       CbcCountRowCut *thisCut = rhs.cuts_[i];
       if (thisCut) {
-        // I think this is correct - new one should take priority
+        // Transfer ownership to the new copy; clear the old owner's slot to
+        // prevent ~CbcNodeInfo from double-deleting the same cut.
         thisCut->setInfo(this, n);
         thisCut->increment(numberBranchesLeft_);
         cuts_[n++] = thisCut;
+        const_cast<CbcNodeInfo &>(rhs).cuts_[i] = NULL;
       }
     }
     numberCuts_ = n;

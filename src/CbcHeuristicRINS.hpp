@@ -32,6 +32,9 @@ public:
   /// Clone
   virtual CbcHeuristic *clone() const;
 
+  /// Classification: improvement heuristic (needs ≥1 solution)
+  virtual HeuristicCategory category() const { return HeuristicCategory::IMPROVEMENT; }
+
   /// Assignment operator
   CbcHeuristicRINS &operator=(const CbcHeuristicRINS &rhs);
 
@@ -56,6 +59,16 @@ public:
     double *newSolution,
     const int *keep);
 
+  // shouldHeurRun()'s non-Legacy schedule-mode fast path (bypassing the
+  // base class's depth/shallow node-count gating -- which has a latent bug
+  // interacting with the whereFrom==3 per-node tree call site: that call
+  // site resets currentPassNumber_ to 0 right before this check, so the
+  // base class's "deep" branch invocation counter -- gated on
+  // getCurrentPassNumber()==1 -- never increments, permanently blocking
+  // solution() from being reached beyond the first few root-adjacent
+  // calls) now lives directly in CbcHeuristic::shouldHeurRun() itself, so
+  // no override is needed here; see its doc comment in CbcHeuristic.hpp.
+
   /// Sets how often to do it
   inline void setHowOften(int value)
   {
@@ -75,6 +88,22 @@ public:
   inline void setSolutionCount(int value)
   {
     numberSolutions_ = value;
+  }
+  /** Sets maximum fractional distance from best-solution integer value for
+      "close" fixing fallback.  When the standard RINS fix-count threshold
+      is not met, integer variables whose current LP value is within this
+      distance of the corresponding best-solution integer value are sorted by
+      closeness and greedily fixed (closest first) until the threshold is met.
+      A value of 0.0 disables the fallback. Default: 0.4.
+      Typical useful values: 0.2 – 0.4.
+   */
+  inline void setFixCloseMaxDist(double value)
+  {
+    fixCloseMaxDist_ = value;
+  }
+  inline double fixCloseMaxDist() const
+  {
+    return fixCloseMaxDist_;
   }
 
 protected:
@@ -98,6 +127,9 @@ protected:
   int lastNode_;
   /// Whether a variable has been in a solution
   char *used_;
+  /** Maximum fractional distance from best-solution integer value for the
+      close-fixing fallback (0.0 = disabled). */
+  double fixCloseMaxDist_;
 };
 #endif
 

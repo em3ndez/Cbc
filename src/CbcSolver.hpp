@@ -3,88 +3,447 @@
 // This code is licensed under the terms of the Eclipse Public License (EPL).
 
 /*! \file CbcSolver.hpp
-    \brief Defines CbcSolver, the proposed top-level class for the new-style
-    cbc solver.
+    \brief Defines CbcSolver, the top-level class for the cbc solver driver.
 
-    This class is currently an orphan. With the removal of all code flagged
-    with the NEW_STYLE_SOLVER, this class is never instantiated (and cannot
-    be instantiated). It is available to be coopted as a top-level object
-    wrapping the current CbcMain0 and CbcMain1, should that appear to be a
-    desireable path forward.  -- lh, 091211 --
+    CbcSolver wraps the full solve pipeline: parameter initialization,
+    command parsing, LP solve, preprocessing, cut/heuristic setup,
+    branch-and-bound, post-processing, and result reporting.
+
+    The free functions CbcMain0 and CbcMain1 are backward-compatible
+    wrappers that delegate to CbcSolver::initialize() and CbcSolver::run().
 */
 
 #ifndef CbcSolver_H
 #define CbcSolver_H
 
+#include "CoinUtilsConfig.h"
+
+#include <deque>
 #include <string>
 #include <vector>
-#include "CoinMessageHandler.hpp"
-#include "OsiClpSolverInterface.hpp"
 
+#include "CoinMessageHandler.hpp"
+#include "CoinModel.hpp"
+
+#include "OsiClpSolverInterface.hpp"
 #if CBC_OTHER_SOLVER == 1
 #include "OsiCpxSolverInterface.hpp"
 #endif
 
+#include "ClpParameters.hpp"
+
+#include "CglCutGenerator.hpp"
+#include "CglPreProcess.hpp"
+
 #include "CbcModel.hpp"
-#include "CbcOrClpParam.hpp"
-#include "CbcSolverConfig.h"
+#include "CbcParameters.hpp"
+#include "CbcMessage.hpp"
+#include "CbcSolverStatistics.hpp"
+#include "CbcSolverCutSetup.hpp"
+
+#ifdef COINUTILS_HAS_GLPK
+#include "glpk.h"
+#endif
 
 class CbcUser;
 class CbcStopNow;
-class CglCutGenerator;
+class CglStored;
+class CbcPreprocHandler;
+class CglTwomir;
 
-//#############################################################################
+// #############################################################################
+// #############################################################################
 
-/*! \brief This allows the use of the standalone solver in a flexible manner.
+/*! \brief User-settable solve options and cross-phase bookkeeping for
+           CbcSolver, with all defaults declared inline.
 
-    It has an original OsiClpSolverInterface and CbcModel which it can use
-    repeatedly, e.g., to get a heuristic solution and then start again.
+    Every field here has value semantics (no owned heap), so this base is
+    copied wholesale by CbcSolver's copy constructor and assignment
+    operator, and restored to defaults by CbcSolver::resetRunState() via a
+    single `CbcSolverOptions::operator=(CbcSolverOptions())`.
 
-    So I [jjf] will need a primitive scripting language which can then call
-    solve and manipulate solution value and solution arrays.
+    The point of splitting these out is that each default is written down
+    exactly once, at the declaration. Previously the same ~100 values were
+    spelled out twice -- once in CbcSolver's constructor initializer list
+    and again in resetRunState() -- so updating one and forgetting the
+    other silently changed behavior depending on whether a CbcSolver was
+    freshly constructed or reused across runs.
 
-    Also provides for user callback functions. Currently two ideas in
-    gestation, CbcUser and CbcStopNow. The latter seems limited to deciding
-    whether or not to stop. The former seems completely general, with a notion
-    of importing and exporting, and a `solve', which should be interpreted as
-    `do whatever this user function does'.
+    Protected rather than public: these are CbcSolver's internals, exposed
+    to it by inheritance only so that existing code can keep referring to
+    `preSolve_` and friends unqualified.
+*/
+class CbcSolverOptions {
+protected:
+  ///@name Cross-phase state from CbcMain1 (previously local variables)
+  //@{
 
-    Parameter initialisation is at last centralised in fillParameters().
+  // --- Solve control flags ---
+  /// Whether a valid model is loaded
+  bool goodModel_ = false;
+  /// Whether in interactive mode
+  bool interactiveMode_ = false;
+  /// False if user changed any cut/heuristic settings
+  bool defaultSettings_ = true;
+  /// Presolve level (0=off, 5=default)
+  int preSolve_ = 5;
+  /// Preprocessing level (0=off, 4=default)
+  int preProcess_ = 4;
+  /// Whether to use strategy
+  bool useStrategy_ = false;
+  /// Whether presolve writes to file
+  bool preSolveFile_ = false;
+  /// Whether strong branching was changed by user
+  bool strongChanged_ = false;
+  /// Whether FPump was changed by user
+  bool pumpChanged_ = false;
+  /// Preprocessing tuning flags
+  int tunePreProcess_ = 0;
+  /// Test OSI parameters flag
+  int testOsiParameters_ = -1;
+  /// 0 normal, 1 from AMPL or MIQP etc (2 allows cuts)
+  int complicatedInteger_ = 0;
+  /// Feasibility pump tuning parameter
+  int initialPumpTune_ = 1003;
+  /// Reduced cost fixing threshold
+  double djFix_ = 1.0e100;
+  /// Tighten factor
+  double tightenFactor_ = 0.0;
+  /// Normal cutoff increment
+  double normalIncrement_ = 0.0;
+  /// Return mode (0=untouched, 1=updated, 2=as babModel)
+  int returnMode_ = 1;
+  /// Solve result (0=optimal, 3=stopped, 6=infeasible, -1=not solved)
+  int integerStatus_ = -1;
+  /// Total number of valid commands processed
+  int numberGoodCommands_ = 0;
+  /// Node strategy
+  int nodeStrategy_ = 0;
+  /// Whether dominated cuts are used
+  bool dominatedCuts_ = false;
+  /// SOS handling flag
+  int doSOS_ = 1;
+  /// Verbose level
+  int verbose_ = 0;
+  /// Cost-based priorities mode
+  int useCosts_ = 0;
+  /// Whether to use input solution (-1 = no)
+  int useSolution_ = -1;
+  /// Index of current best solution
+  int currentBestSolution_ = 0;
+
+  // --- LP solver control ---
+  /// Idiot crash method (-1 = auto)
+  int doIdiot_ = -1;
+  /// Output format (2 = default)
+  int outputFormat_ = 2;
+  /// SLP value
+  int slpValue_ = -1;
+  /// C++ code generation value
+  int cppValue_ = -1;
+  /// Print options
+  int printOptions_ = 0;
+  /// Print mode
+  int printMode_ = 0;
+  /// Presolve options
+  int presolveOptions_ = 0;
+  /// Substitution level
+  int substitution_ = 3;
+  /// Dualize level
+  int dualize_ = 3;
+  /// Crash method
+  int doCrash_ = 0;
+  /// Vector mode
+  int doVector_ = 0;
+  /// Sprint method (-1 = auto)
+  int doSprint_ = -1;
+  /// Scaling method
+  int doScaling_ = 4;
+
+  // --- Barrier solver control ---
+  /// Cholesky type
+  int choleskyType_ = 0;
+  /// Gamma for barrier
+  int gamma_ = 0;
+  /// Barrier scaling
+  int scaleBarrier_ = 0;
+  /// KKT method
+  int doKKT_ = 0;
+  /// Crossover method (2 = do unless quadratic)
+  int crossover_ = 2;
+  /// Whether problem is bilinear
+  bool biLinearProblem_ = false;
+
+  // --- Cut generator modes ---
+  // Each field is a CbcParameters::CutStrategy value (CGOff/CGOn/CGRoot/
+  // CGIfMove/CGForceOn/...) controlling whether/how often the named cut
+  // generator is installed on babModel_ by configureCutGenerators().
+  /// Gomory mixed-integer cuts strategy
+  int gomoryMode_ = CbcParameters::CGIfMove;
+  /// Probing cuts strategy
+  int probingMode_ = CbcParameters::CGIfMove;
+  /// Knapsack cover cuts strategy
+  int knapsackMode_ = CbcParameters::CGIfMove;
+  /// Reduce-and-split cuts strategy
+  int redsplitMode_ = CbcParameters::CGOff;
+  /// Reduce-and-split (v2) cuts strategy
+  int redsplit2Mode_ = CbcParameters::CGRoot;
+  /// Gomory mixed-integer (alternative implementation) cuts strategy
+  int GMIMode_ = CbcParameters::CGRoot;
+  /// Clique cuts strategy
+  int cliqueMode_ = CbcParameters::CGIfMove;
+  /// Legacy (pre-conflict-graph) clique cuts strategy
+  int oldCliqueMode_ = CbcParameters::CGIfMove;
+  /// Odd-wheel cuts strategy
+  int oddWheelMode_ = CbcParameters::CGOff;
+  /// Mixed-integer-rounding cuts strategy
+  int mixedMode_ = CbcParameters::CGIfMove;
+  /// Mixed-integer-rounding cut rounding sub-strategy
+  int mixedRoundStrategy_ = 1;
+  /// Flow-cover cuts strategy
+  int flowMode_ = CbcParameters::CGIfMove;
+  /// Two-step MIR (twomir) cuts strategy
+  int twomirMode_ = CbcParameters::CGIfMove;
+  /// Lift-and-project cuts strategy
+  int landpMode_ = CbcParameters::CGRoot;
+  /// Residual capacity cuts strategy
+  int residualCapacityMode_ = CbcParameters::CGOff;
+  /// Zero-half cuts strategy
+  int zerohalfMode_ = CbcParameters::CGIfMove;
+  /// Conflict graph mode ("on"/"off"/"clq")
+  std::string cgraphMode_ = "on";
+  /// Clique strengthening mode ("before"/"after"/"off")
+  std::string clqstrMode_ = "both";
+  /// BK clique pivoting strategy
+  int bkPivotingStrategy_ = 3;
+  /// Max calls to BK
+  int maxCallsBK_ = 1000;
+  /// BK clique extension method
+  int bkClqExtMethod_ = 4;
+  /// Odd wheel extension method
+  int oddWExtMethod_ = 2;
+
+  // --- MIP start ---
+  std::vector< std::pair< std::string, double > > mipStart_;
+  std::vector< std::pair< std::string, double > > mipStartBefore_;
+  std::string mipStartFile_;
+  /// SppGrasp on the original model: 0 not tried, 1 applicable, 2 applicable
+  /// with artificial slacks, -1 not applicable
+  int sppGraspOriginal_ = 0;
+  /// Whether the original-model SppGrasp call returned a real-feasible solution
+  bool sppGraspOriginalSolution_ = false;
+
+  // --- Import control ---
+  /// Whether MPS/LP read errors are tolerated (0=fail on error, nonzero=continue)
+  int allowImportErrors_ = 0;
+  /// Whether original row/column names are kept on import (0=discard, nonzero=keep)
+  int keepImportNames_ = 1;
+
+  // --- Names ---
+  /// Maximum row/column name length recorded for the current model (0 if names unavailable)
+  int lengthName_ = 0;
+  /// Row names for the current model, indexed by row number
+  std::vector< std::string > rowNames_;
+  /// Column names for the current model, indexed by column number
+  std::vector< std::string > columnNames_;
+
+  // --- Debug ---
+  /// Number of entries in debugValues_ (-1 if not loaded)
+  int numberDebugValues_ = -1;
+  /// Whether a debug basis has been loaded (-1=not loaded, 1=loaded)
+  int basisHasValues_ = 0;
+
+  // --- Timing ---
+  /// Accumulated CPU time across the run (seconds)
+  double totalTime_ = 0.0;
+  /// CPU time reference point (seconds), reset at various phase boundaries
+  double time0_ = 0.0;
+  /// Elapsed (wall-clock) time reference point (seconds)
+  double time0Elapsed_ = 0.0;
+
+  // --- Input queue copies ---
+  std::deque< std::string > saveInputQueue_;
+  //@}
+};
+
+// #############################################################################
+// #############################################################################
+
+/*! \brief Heap-owning, per-run state for CbcSolver, with all defaults
+           declared inline.
+
+    Unlike CbcSolverOptions, these fields own raw allocations, so they are
+    deliberately NOT propagated by copy: a copied or assigned CbcSolver
+    starts with a clean per-run slate rather than aliasing (and eventually
+    double-freeing) the source's arrays. That was already the behavior of
+    the hand-written copy constructor and assignment operator; making the
+    base non-copyable turns it into a rule the compiler enforces.
+
+    freePerRunState() is the single cleanup list, shared by
+    ~CbcSolverPerRunState() and resetPerRunState(). It used to be written
+    out twice -- once in CbcSolver's destructor and once in
+    resetRunState() -- with the destructor's list a strict superset.
+*/
+class CbcSolverPerRunState {
+protected:
+  CbcSolverPerRunState() = default;
+  ~CbcSolverPerRunState() { freePerRunState(); }
+
+  /*! Per-run state is never copied (see class comment); a CbcSolver copy
+      gets a default-constructed base instead. Move-assignment exists only
+      to back resetPerRunState(). */
+  CbcSolverPerRunState(const CbcSolverPerRunState &) = delete;
+  CbcSolverPerRunState &operator=(const CbcSolverPerRunState &) = delete;
+  CbcSolverPerRunState &operator=(CbcSolverPerRunState &&) = default;
+
+  /*! Release every allocation owned by this base. Leaves the pointers
+      dangling, so callers must either be destructing or immediately
+      re-seed defaults (which is what resetPerRunState() does). */
+  void freePerRunState();
+
+  /*! Free all per-run allocations and restore every field to its declared
+      default, ready for another run() on the same CbcSolver. */
+  void resetPerRunState()
+  {
+    freePerRunState();
+    *this = CbcSolverPerRunState();
+  }
+
+  ///@name Per-run state
+  //@{
+  /// Updated model (created during B&B, deleted after)
+  CbcModel *babModel_ = nullptr;
+  /// Pre-preprocessing solver clone (saved for postprocessing)
+  OsiSolverInterface *saveSolver_ = nullptr;
+
+  // --- Branching input (from AMPL or priority files) ---
+  /// Per-column branching priority (one entry per column), or NULL if unset
+  int *priorities_ = nullptr;
+  /// Per-column forced branch direction (-1/0/1), or NULL if unset
+  int *branchDirection_ = nullptr;
+  /// Per-column down-branch pseudocost, or NULL if unset
+  double *pseudoDown_ = nullptr;
+  /// Per-column up-branch pseudocost, or NULL if unset
+  double *pseudoUp_ = nullptr;
+  /// Per-column starting solution values supplied by AMPL, or NULL if unset
+  double *solutionIn_ = nullptr;
+  /// Per-column priorities supplied together with solutionIn_, or NULL if unset
+  int *prioritiesIn_ = nullptr;
+  /// Number of SOS (special ordered sets) constraints supplied by AMPL
+  int numberSOS_ = 0;
+  /// Start index (into sosIndices_/sosReference_) of each SOS, size numberSOS_+1
+  int *sosStart_ = nullptr;
+  /// Column indices referenced by each SOS, concatenated per sosStart_
+  int *sosIndices_ = nullptr;
+  /// Type (1 or 2) of each SOS, one entry per SOS
+  char *sosType_ = nullptr;
+  /// Reference row weights for each SOS entry, concatenated per sosStart_
+  double *sosReference_ = nullptr;
+  /// AMPL "cut" markers (columns that must remain in the model), or NULL if unset
+  int *cut_ = nullptr;
+  /// Per-SOS branching priority, one entry per SOS, or NULL if unset
+  int *sosPriority_ = nullptr;
+
+  // --- Knapsack expansion ---
+  /// Map from original model column to expanded-knapsack sub-model column, or NULL
+  int *whichColumn_ = nullptr;
+  /// Start index (into knapsackRow_) of each expanded knapsack row, size numberKnapsack_+1
+  int *knapsackStart_ = nullptr;
+  /// Original model row index of each expanded knapsack, one entry per knapsackStart_ range
+  int *knapsackRow_ = nullptr;
+  /// Number of knapsack constraints expanded
+  int numberKnapsack_ = 0;
+
+  // --- Debug ---
+  /// Reference solution values loaded via -debug/-checkSolution, or NULL if unset
+  double *debugValues_ = nullptr;
+
+  // --- Statistics ---
+  /*! Solve statistics. Lives with the per-run state rather than the
+      copied options because it owns three raw arrays (number_cuts,
+      name_generators, time_generators) that freePerRunState() releases;
+      copying it would alias them. Consistent with the previous
+      hand-written copy constructor and assignment operator, neither of
+      which propagated it. */
+  CbcSolverStatistics statistics_;
+
+  // --- Lot sizing ---
+  /// One semi-continuous/lot-sizing variable: allowed range [low,high] plus its column index
+  struct LotStruct {
+    /// Lower bound of the allowed lot-sizing range (in addition to 0)
+    double low;
+    /// Upper bound of the allowed lot-sizing range
+    double high;
+    /// Column index this lot-sizing entry applies to
+    int column;
+  };
+  /// Lot-sizing entries collected from the model, one per lot-sized column
+  LotStruct *lotsize_ = nullptr;
+  /// Number of entries in lotsize_
+  int numberLotSizing_ = 0;
+
+  // --- GLPK state ---
+#ifdef COINUTILS_HAS_GLPK
+  /// GLPK MathProg translator, used when importing a GMPL/AMPL-style model via GLPK
+  glp_tran *coin_glp_tran_ = nullptr;
+  /// GLPK problem instance backing coin_glp_tran_'s translated model
+  glp_prob *coin_glp_prob_ = nullptr;
+#endif
+  //@}
+};
+
+// #############################################################################
+// #############################################################################
+
+/*! \brief Top-level driver class for the CBC MIP solver.
+
+    Encapsulates the full solve pipeline: parameter initialization,
+    command parsing, LP solve, preprocessing, cut/heuristic setup,
+    branch-and-bound, post-processing, and result reporting.
+
+    Usage patterns:
+
+    \code
+    // Pattern 1: One-call solve
+    CbcSolver cbc;
+    cbc.solve("problem.mps");
+    if (cbc.hasSolution())
+      printf("Obj: %g\n", cbc.objectiveValue());
+
+    // Pattern 2: Import, configure, then solve
+    CbcSolver cbc;
+    cbc.importModel("problem.mps");
+    cbc.parameters()[CbcParam::TIMELIMIT]->setVal(300.0);
+    cbc.parameters()[CbcParam::GOMORYCUTS]->setVal("off");
+    std::deque<std::string> q = {"-solve", "-quit"};
+    cbc.run(q);
+
+    // Pattern 3: argc/argv (backward compatible)
+    CbcSolver cbc(solver);
+    cbc.initialize();
+    cbc.run(argc, argv);
+    \endcode
+
+    The free functions CbcMain0/CbcMain1 still work for backward
+    compatibility and delegate to this class internally.
 */
 
-class CBCSOLVERLIB_EXPORT CbcSolver {
+class CBCLIB_EXPORT CbcSolver : public CbcSolverOptions,
+                                public CbcSolverPerRunState {
 
 public:
-  ///@name Solve method
-  //@{
-  /** This takes a list of commands, does "stuff" and returns
-        returnMode -
-        0 model and solver untouched - babModel updated
-        1 model updated - just with solution basis etc
-        2 model updated i.e. as babModel (babModel NULL) (only use without preprocessing)
-    */
-  int solve(int argc, const char *argv[], int returnMode);
-  /** This takes a list of commands, does "stuff" and returns
-        returnMode -
-        0 model and solver untouched - babModel updated
-        1 model updated - just with solution basis etc
-        2 model updated i.e. as babModel (babModel NULL) (only use without preprocessing)
-    */
-  int solve(const char *input, int returnMode);
-  //@}
-  ///@name Constructors and destructors etc
+  ///@name Constructors and destructors
   //@{
   /// Default Constructor
   CbcSolver();
 
   /// Constructor from solver
-  CbcSolver(const OsiClpSolverInterface &);
+  explicit CbcSolver(const OsiClpSolverInterface &);
 
   /// Constructor from model
-  CbcSolver(const CbcModel &);
+  explicit CbcSolver(const CbcModel &);
 
-  /** Copy constructor .
-     */
+  /** Copy constructor. */
   CbcSolver(const CbcSolver &rhs);
 
   /// Assignment operator
@@ -92,15 +451,293 @@ public:
 
   /// Destructor
   ~CbcSolver();
-  /// Fill with standard parameters
-  void fillParameters();
-  /*! \brief Set default values in solvers from parameters
+  //@}
 
-      Misleading. The current code actually reads default values from
-      the underlying solvers and installs them as default values for a subset of
-      parameters in #parameters_.
-    */
-  void fillValuesInSolver();
+  ///@name Initialization (replaces CbcMain0)
+  //@{
+  /** Initialize default parameters, signal handlers, and LP solver state.
+      Must be called before run(). Replaces the body of CbcMain0. */
+  void initialize();
+  //@}
+
+  ///@name High-level solve
+  //@{
+  /** Import a model file and solve it with current parameters.
+      Convenience method that chains initialize() + import + run(-solve -quit).
+      \param filename  Path to MPS/LP/GMPL file (supports .gz/.bz2)
+      \return 0 on success
+  */
+  int solve(const std::string &filename);
+
+  /** Import a model from a file.
+      Calls initialize() if not already done, then reads the file.
+      \param filename  Path to MPS/LP/GMPL file (supports .gz/.bz2)
+      \return 0 on success
+  */
+  int importModel(const std::string &filename);
+
+  /** Solve the LP relaxation only (no branch-and-bound).
+      Uses the current -lpMethod setting (dual/primal/barrier).
+      \param method  "dual", "primal", or "barrier" (empty = use current setting)
+      \return 0 on success
+  */
+  int solveLp(const std::string &method = "");
+  //@}
+
+  ///@name Result accessors (valid after solve/run)
+  //@{
+  /// Solve status: 0=optimal, 1=infeasible, 2=unbounded, 3+=stopped
+  int status() const;
+  /// Best objective value found (COIN_DBL_MAX if no solution)
+  double objectiveValue() const;
+  /// Best bound (dual bound from B&B tree)
+  double bestBound() const;
+  /// Best integer solution (NULL if none found)
+  const double *bestSolution() const;
+  /// Number of columns in the model
+  int numCols() const;
+  /// Number of B&B nodes explored
+  int nodeCount() const;
+  /// Number of simplex iterations
+  int iterationCount() const;
+  /// Whether a feasible solution was found
+  bool hasSolution() const;
+  //@}
+
+  ///@name Run (replaces CbcMain1)
+  //@{
+  /** Run the solver with a command queue.
+      This is the primary entry point that replaces CbcMain1.
+      \param inputQueue  Command tokens (consumed during processing)
+      \param callBack    User callback invoked at 6 defined points (default: no-op)
+      \param info        AMPL interface data (NULL when not using AMPL)
+      \return 0 on normal completion, non-zero if callback requests early exit
+  */
+  int run(std::deque< std::string > inputQueue,
+    int callBack(CbcModel *currentSolver, int whereFrom) = nullptr,
+    ampl_info *info = nullptr);
+
+  /** Run the solver with argc/argv arguments.
+      Converts to a command queue and delegates to the deque overload. */
+  int run(int argc, const char *argv[],
+    int callBack(CbcModel *currentSolver, int whereFrom) = nullptr,
+    ampl_info *info = nullptr);
+  //@}
+
+  ///@name Heuristics and cut generator configuration
+  //@{
+  /** Configure/run heuristics on the given model, using this solver's
+      current parameter and tuning settings (noPrinting, initialPumpTune_).
+      Thin wrapper exposing the free function doHeuristics() as a
+      class-level call surface, so heuristic setup can be invoked directly
+      on a CbcSolver instance rather than only from run().
+      \param model  the CbcModel to configure/run heuristics on
+      \param type   1=register heuristics on model for the B&B tree,
+                    2=run heuristics now (may set cutoff/best solution),
+                    3=legacy reduced-heuristics mode (skips some heuristics),
+                    10+=use lastSolution and relax a few variables first
+      \return number of heuristic solutions found (type 2), or 0 for
+              registration-only calls
+  */
+  int configureHeuristics(CbcModel *model, int type);
+  /** Runs SppGrasp on the original (not yet preprocessed) model when it is a
+      set partitioning/packing problem with slacks (or, with
+      sppGraspArtificial, artificial ones where missing), installing any solution
+      found as incumbent of model_ and babModel_. Sets sppGraspOriginal_. */
+  void babRunSppGraspOriginal();
+
+  /** Register all cut generators on babModel based on this solver's
+      current parameter, conflict-graph, and clique-detection settings.
+      Thin wrapper exposing the free function installCutGenerators() as a
+      class-level call surface.
+      \param babModel  the CbcModel to install cut generators on
+      \param bkPivotingStrategy  Bron-Kerbosch pivoting strategy for
+                       clique/odd-wheel cut generation
+      \param switchOffChoice  if not NULL, receives a log line with the
+                       cutSwitchOff values in effect
+  */
+  void configureCutGenerators(CbcModel &babModel,
+    CoinBronKerbosch::PivotingStrategy bkPivotingStrategy,
+    std::string *switchOffChoice = NULL);
+  //@}
+
+  ///@name Individual solve actions (reusable on any solver instance)
+  //@{
+  /** Solve the LP relaxation of \p targetSolver using every LP-related
+      option currently configured on this CbcSolver (CbcParameters,
+      ClpParameters): -lpMethod (auto/dual/primal/barrier), -racingLP,
+      presolve, crash/idiot/sprint, SLP, dualize, PSI positive-edge,
+      objective scaling, vector mode, time limits, etc.
+
+      This is the single unified LP-solve entry point used internally for
+      the root LP relaxation (via solveInitialLp()) and for the
+      SOLVECONTINUOUS (-initialSolve) action; it is exposed here so the
+      exact same, fully-configured root-LP solve can be triggered directly
+      on an arbitrary OsiClpSolverInterface — e.g. one owned by an external
+      caller such as the C interface — without duplicating any of this
+      solver's option-translation logic.
+
+      Runs, in order:
+        1. Model-level LP settings (PSI, objective scaling, vector mode).
+        2. LP racing, if enabled.
+        3. Full ClpSolve LP solve with all user-settable options.
+
+      Bound propagation and clique merging "before" used to be the first two
+      steps here, run unconditionally on every call; they are now the
+      standalone preRootLPStrenghtening() action instead, so that it can be
+      gated independently (e.g. by -preRootLPStrenghtening in the BAB
+      pipeline's babPreRootLPStrenghtening()) and run at most once even when
+      applyLpMethod() itself is retried. Callers that still want the old
+      combined behavior (e.g. runSolveContinuous(), for the CLP LP-only
+      commands) call preRootLPStrenghtening() explicitly first.
+
+      This is the single place where the root-node (or standalone) LP
+      relaxation is actually solved: -solveContinuous (SOLVECONTINUOUS) and
+      the CLP -dualSimplex/-primalSimplex/-barrier commands all call this
+      method (the latter via runSolveContinuous(), forcing their respective
+      method), instead of each keeping their own copy of the option-setting
+      logic.
+
+      \param targetSolver  Solver whose LP relaxation should be solved.
+                            Pass nullptr (the default) to operate on this
+                            CbcSolver's own model_.solver().
+      \param forcedMethod  A CbcParameters::LPMethod value to force for this
+                            call only (bypassing -lpMethod=auto and LP
+                            racing, which only make sense when the caller
+                            lets us pick the method). Pass -1 (the default)
+                            to use the currently configured -lpMethod
+                            (including auto/racing).
+      \return 0  LP solve completed (racing winner or standard solve). Kept
+                  as an int (rather than void) for interface stability with
+                  existing callers, which historically also checked for a
+                  negative "infeasible" result from the bound-propagation
+                  step now performed by preRootLPStrenghtening() instead.
+  */
+  int applyLpMethod(OsiClpSolverInterface *targetSolver = nullptr,
+    int forcedMethod = -1);
+
+  /** Install reoptMethod/reoptPertValue/reoptPresolve on a solver.
+      Called after the initial LP; can also be called explicitly before
+      resolving a caller-owned solver. Settings survive solver clones.
+  */
+  void applyReoptimizationOptions(OsiClpSolverInterface *targetSolver = nullptr);
+
+  /** Shared CLI/C interface translation. presolve is -1 (inherit), 0 or 1;
+      perturbation is -1 (inherit) or a Clp perturbation value. Barrier always
+      includes crossover, irrespective of the root-LP crossover setting.
+  */
+  static void configureReoptimization(OsiClpSolverInterface *solver,
+    CbcParameters::ReoptMethod method, int perturbation = -1,
+    int presolve = -1, int threads = 0, int barrierOptions = 0);
+
+  /** Run the currently configured bound propagation (singletons / fixpoint
+      / MILP-based bound tightening, per -boundPropLevel and
+      -boundPropMaxRounds) on \p solver in place.
+
+      \param solver  Solver to tighten. Pass nullptr (the default) to
+                      operate on this CbcSolver's own model_.solver().
+      \return true if the problem remains feasible after tightening
+              (bounds/rows updated in place on \p solver), false if
+              infeasibility was proved.
+  */
+  bool strengthenBounds(OsiSolverInterface *solver = nullptr);
+
+  /** Build/refresh the conflict graph of \p solver and strengthen
+      set-packing/partitioning cliques against it (extend or dominate
+      constraints), optionally re-solving/resolving the LP afterwards.
+
+      \param solver           Solver to strengthen. Pass nullptr (the
+                               default) to operate on this CbcSolver's own
+                               model_.solver().
+      \param mode              "before" (a subsequent solve is expected;
+                               no resolve is performed here) or "after"
+                               (the LP is resolved in place once
+                               strengthening is done).
+      \param strengthenMode    Strategy flag forwarded to
+                               CglCliqueStrengthening::strengthenCliques().
+      \param clqExtendedOut    Optional: number of constraints extended.
+      \param clqDominatedOut   Optional: number of constraints dominated.
+      \param handler           Optional message handler override. Pass
+                               nullptr (the default) to use this
+                               CbcSolver's own model_.messageHandler().
+      \return true if any bounds or constraints were changed.
+  */
+  bool strengthenCliques(OsiSolverInterface *solver = nullptr,
+    const std::string &mode = "before", int strengthenMode = 2,
+    int *clqExtendedOut = nullptr, int *clqDominatedOut = nullptr,
+    CoinMessageHandler *handler = nullptr);
+
+  /** Tighten oversized integer coefficients of \p solver in place
+      ("big-M strengthening", per -coefStrengthening): an integer coefficient
+      larger than its row's slack is shrunk to that slack with a compensating
+      right-hand-side change. The LP relaxation gets tighter while the
+      integer-feasible set is unchanged, and no variable is removed, so the
+      model callbacks see is left intact.
+
+      Does nothing when -coefStrengthening is off.
+
+      \param solver  Solver to tighten. Pass nullptr (the default) to
+                      operate on this CbcSolver's own model_.solver().
+  */
+  void strengthenCoefficients(OsiSolverInterface *solver = nullptr);
+
+  /** Remove redundant rows of \p solver in place (per -rowReductions): rows
+      all of whose columns are fixed, and rows that are duplicates or scalar
+      multiples of another row (whose bounds are merged into the survivor).
+
+      Does nothing when -rowReductions is off.
+
+      **MIP only.** This step deletes rows, and there is no postsolve at this
+      point in the pipeline to recover a dual value for a deleted row. Cbc
+      reports no duals for a MIP, so it is free on the branch-and-bound path,
+      but it must not run for the LP-only commands. That decision is made by
+      preRootLPStrenghtening()'s \c allowRowRemoval parameter, which is what
+      gates the only call to this method.
+
+      \param solver  Solver to reduce. Pass nullptr (the default) to
+                      operate on this CbcSolver's own model_.solver().
+      \return true if the problem remains feasible (this includes the common
+              "nothing found" case), false if infeasibility was proved.
+  */
+  bool reduceRows(OsiSolverInterface *solver = nullptr);
+
+  /** Groups bound propagation (strengthenBounds()), clique merging
+      "before" (strengthenCliques()), coefficient tightening
+      (strengthenCoefficients()) and -- on the MIP path only -- row reductions
+      (reduceRows()) into a single, explicitly callable
+      pre-root-LP strengthening action, run in place on \p solver ahead of
+      the root LP relaxation solve. Deliberately does NOT resolve/re-solve
+      the LP afterwards -- clique merging always runs in "before" mode here
+      -- since LP optimization is left entirely to
+      applyLpMethod()/solveInitialLp() downstream.
+
+      This is what used to be steps 1-2 of applyLpMethod(), run
+      unconditionally on every call including plain LP-only actions
+      (SOLVECONTINUOUS, -dualSimplex, ...); it is now a standalone action so
+      the BAB pipeline can gate it behind the -preRootLPStrenghtening meta
+      switch (see babPreRootLPStrenghtening()), and callers that still want
+      the old combined behavior (e.g. runSolveContinuous()) call it
+      explicitly before applyLpMethod().
+
+      \param solver  Solver to strengthen. Pass nullptr (the default) to
+                      operate on this CbcSolver's own model_.solver().
+      \param allowRowRemoval  Whether the row-reduction step (reduceRows())
+                      may run, which *deletes* rows. Only safe when the caller
+                      will not report dual values, i.e. on the MIP path --
+                      babPreRootLPStrenghtening() passes true, while the
+                      LP-only commands keep the default. The default is the
+                      safe value on purpose: forgetting to pass it loses a
+                      reduction, never a dual value.
+      \return true if the problem remains feasible after strengthening
+              (bounds/rows updated in place on \p solver), false if
+              infeasibility was proved.
+  */
+  bool preRootLPStrenghtening(OsiSolverInterface *solver = nullptr,
+    bool allowRowRemoval = false);
+  //@}
+
+  ///@name User extensions
+  //@{
   /// Add user function
   void addUserFunction(CbcUser *function);
   /// Set user call back
@@ -108,239 +745,386 @@ public:
   /// Add cut generator
   void addCutGenerator(CglCutGenerator *generator);
   //@}
-  ///@name miscellaneous methods to line up with old
+
+  ///@name Accessors
   //@{
-  // analyze model
-  int *analyze(OsiClpSolverInterface *solverMod, int &numberChanged, double &increment,
-    bool changeInt, CoinMessageHandler *generalMessageHandler);
-  /** 1 - add heuristics to model
-        2 - do heuristics (and set cutoff and best solution)
-        3 - for miplib test so skip some
-        (out model later)
-    */
-  //int doHeuristics(CbcModel * model, int type);
-  /** Updates model_ from babModel_ according to returnMode
-        returnMode -
-        0 model and solver untouched - babModel updated
-        1 model updated - just with solution basis etc
-        2 model updated i.e. as babModel (babModel NULL) (only use without preprocessing)
-    */
-  void updateModel(ClpSimplex *model2, int returnMode);
-  //@}
-  ///@name useful stuff
-  //@{
-  /// Get int value
-  int intValue(CbcOrClpParameterType type) const;
-  /// Set int value
-  void setIntValue(CbcOrClpParameterType type, int value);
-  /// Get double value
-  double doubleValue(CbcOrClpParameterType type) const;
-  /// Set double value
-  void setDoubleValue(CbcOrClpParameterType type, double value);
+  /// Get int parameter value
+  int intValue(int code);
+  /// Set int parameter value
+  void setIntValue(int code, int value);
+  /// Get double parameter value
+  double doubleValue(int code);
+  /// Set double parameter value
+  void setDoubleValue(int code, double value);
   /// User function (NULL if no match)
   CbcUser *userFunction(const char *name) const;
-  /// Return original Cbc model
-  inline CbcModel *model()
-  {
-    return &model_;
-  }
-  /// Return updated Cbc model
-  inline CbcModel *babModel()
-  {
-    return babModel_;
-  }
-  /// Number of userFunctions
-  inline int numberUserFunctions() const
-  {
-    return numberUserFunctions_;
-  }
+  /// Return reference CbcModel
+  inline CbcModel *model() { return &model_; }
+  /// Return updated CbcModel (after B&B)
+  inline CbcModel *babModel() { return babModel_; }
+  /// Return parameters
+  inline CbcParameters &parameters() { return parameters_; }
+  inline const CbcParameters &parameters() const { return parameters_; }
+  /// Number of user functions
+  inline int numberUserFunctions() const { return numberUserFunctions_; }
   /// User function array
-  inline CbcUser **userFunctionArray() const
-  {
-    return userFunction_;
-  }
-  /// Copy of model on initial load (will contain output solutions)
-  inline OsiClpSolverInterface *originalSolver() const
-  {
-    return originalSolver_;
-  }
-  /// Copy of model on initial load
-  inline CoinModel *originalCoinModel() const
-  {
-    return originalCoinModel_;
-  }
-  /// Copy of model on initial load (will contain output solutions)
+  inline CbcUser **userFunctionArray() const { return userFunction_; }
+  /// Original solver (will contain output solutions)
+  inline OsiClpSolverInterface *originalSolver() const { return originalSolver_; }
+  /// Original CoinModel
+  inline CoinModel *originalCoinModel() const { return originalCoinModel_; }
+  /// Set original solver
   void setOriginalSolver(OsiClpSolverInterface *originalSolver);
-  /// Copy of model on initial load
+  /// Set original CoinModel
   void setOriginalCoinModel(CoinModel *originalCoinModel);
-  /// Number of cutgenerators
-  inline int numberCutGenerators() const
-  {
-    return numberCutGenerators_;
-  }
+  /// Number of cut generators
+  inline int numberCutGenerators() const { return numberCutGenerators_; }
   /// Cut generator array
-  inline CglCutGenerator **cutGeneratorArray() const
-  {
-    return cutGenerator_;
-  }
+  inline CglCutGenerator **cutGeneratorArray() const { return cutGenerator_; }
   /// Start time
-  inline double startTime() const
-  {
-    return startTime_;
-  }
+  inline double startTime() const { return startTime_; }
   /// Whether to print to std::cout
-  inline void setPrinting(bool onOff)
-  {
-    noPrinting_ = !onOff;
-  }
+  inline void setPrinting(bool onOff) { noPrinting_ = !onOff; }
   /// Where to start reading commands
-  inline void setReadMode(int value)
-  {
-    readMode_ = value;
-  }
+  inline void setReadMode(int value) { readMode_ = value; }
+  /// Solve statistics (populated after run())
+  inline const CbcSolverStatistics &getStatistics() const { return statistics_; }
   //@}
-private:
-  ///@name Private member data
-  //@{
 
+private:
+  ///@name Core state (existed in original CbcSolver class)
+  //@{
+  // Per-run and option state live in the CbcSolverPerRunState and
+  // CbcSolverOptions bases, where each field's default is declared inline
+  // exactly once. Only state that is neither (owned for the lifetime of
+  // the CbcSolver, or needing a non-trivial copy) is declared here.
   /// Reference model
   CbcModel model_;
-
-  /// Updated model
-  CbcModel *babModel_;
-
   /// User functions
-  CbcUser **userFunction_;
-  /** Status of user functions
-        0 - not used
-        1 - needs cbc_load
-        2 - available - data in coinModel
-        3 - data loaded - can do cbc_save
-    */
-  int *statusUserFunction_;
-  /// Copy of model on initial load (will contain output solutions)
-  OsiClpSolverInterface *originalSolver_;
-  /// Copy of model on initial load
-  CoinModel *originalCoinModel_;
+  CbcUser **userFunction_ = nullptr;
+  /// Status of user functions (0=not used, 1=needs load, 2=available, 3=loaded)
+  int *statusUserFunction_ = nullptr;
+  /// Original solver (will contain output solutions)
+  OsiClpSolverInterface *originalSolver_ = nullptr;
+  /// Original CoinModel
+  CoinModel *originalCoinModel_ = nullptr;
   /// Cut generators
-  CglCutGenerator **cutGenerator_;
+  CglCutGenerator **cutGenerator_ = nullptr;
   /// Number of user functions
-  int numberUserFunctions_;
+  int numberUserFunctions_ = 0;
   /// Number of cut generators
-  int numberCutGenerators_;
-  /// Stop now stuff
-  CbcStopNow *callBack_;
-  /// Cpu time at instantiation
-  double startTime_;
-  /// Parameters and values
-  std::vector< CbcOrClpParam > parameters_;
-  /// Whether to do miplib test
-  bool doMiplib_;
-  /// Whether to print to std::cout
-  bool noPrinting_;
+  int numberCutGenerators_ = 0;
+  /// Stop-now callback
+  CbcStopNow *callBack_ = nullptr;
+  /// CPU time at instantiation
+  double startTime_ = 0.0;
+  /// Parameters
+  ClpParameters clpParameters_;
+  CbcParameters parameters_;
+  /// Whether to suppress printing
+  bool noPrinting_ = false;
   /// Where to start reading commands
-  int readMode_;
+  int readMode_ = 1;
+
+  // --- Preprocessing state ---
+  /// Preprocessing engine
+  CglPreProcess process_;
+
+  // --- Stored AMPL cuts ---
+  // (managed internally during run, not exposed)
+
+  /// Collected parameter-change messages (printed as a section before solve)
+  std::vector< std::string > paramChanges_;
+  /// Clp parameters given on the command line (ClpParam codes), so branch
+  /// and bound can be handed exactly those and nothing else
+  std::vector< int > clpParamsSetByUser_;
+  //@}
+
+  ///@name Private helpers
+  //@{
+  /// Reset cross-phase state to defaults (called by initialize)
+  void resetRunState();
+
+  /// Print collected parameter changes as a formatted section, then clear.
+  void printParamChanges();
+
+  /** Handle the IMPORT action: read an MPS/LP/GMPL file into the model.
+      Called from run() when the IMPORT command is encountered.
+      \param inputQueue  Command queue (for reading filename and .par file)
+      \param clpSolver   Current OsiClp solver interface
+      \param lpSolver    Current ClpSimplex (may be updated)
+      \param time1       CPU time reference (updated on success)
+      \param totalTime   Accumulated time (updated on success)
+  */
+  void importModel(std::deque< std::string > &inputQueue,
+    OsiClpSolverInterface *clpSolver, ClpSimplex *lpSolver,
+    double &time1, double &totalTime);
+
+  /** Handle the WRITESOL/PRINTSOL/WRITEGMPLSOL/WRITENEXTSOL action.
+      Called from run() when a solution-writing command is encountered.
+      \param cbcParamCode  Which solution-write variant was requested
+      \param inputQueue    Command queue (for reading filename)
+      \param clpSolver     Current OsiClp solver interface
+      \param lpSolver      Current ClpSimplex
+  */
+  void writeSolution(int cbcParamCode,
+    std::deque< std::string > &inputQueue,
+    OsiClpSolverInterface *clpSolver, ClpSimplex *lpSolver);
+
+  /** Solve the root LP relaxation.
+      Called from the BAB action.
+      \return 0=success, 1=break BAB, 2=continue loop, 3=return from run()
+  */
+  int solveInitialLp(
+    int logLevel, int cbcLogLevel,
+    CbcSolverStatistics &statistics,
+    int &returnCode,
+    int callBack(CbcModel *currentSolver, int whereFrom));
+
+  /** Run CglPreProcess preprocessing on the model.
+      Called from the BAB action when preProcess is enabled.
+      \return 0=success, 1=break BAB, 3=return from run()
+  */
+  int preprocess(
+    CglPreProcess &process,
+    OsiClpSolverInterface *&clpSolver, ClpSimplex *&lpSolver,
+    OsiClpSolverInterface *originalSolver,
+    CbcSolverStatistics &statistics,
+    int &returnCode,
+    int callBack(CbcModel *currentSolver, int whereFrom),
+    ampl_info *info,
+    int &truncateColumns, int &truncateRows,
+    bool &redoSOS, double *&truncatedRhsLower, double *&truncatedRhsUpper,
+    int *&newPriorities, bool integersOK, int numberOriginalColumns,
+    CbcPreprocHandler *&preprocHandler, double &preprocStart);
+
+  /** Run postprocessing after branch-and-bound and report results.
+      Called at the end of the BAB action.
+      \return 0=success (caller breaks BAB), 3=return from run()
+  */
+  int postprocess(
+    CglPreProcess &process,
+    OsiClpSolverInterface *clpSolver, ClpSimplex *lpSolver,
+    OsiClpSolverInterface *originalSolver,
+    CbcSolverStatistics &statistics,
+    double time1, double time1Elapsed,
+    int &returnCode,
+    int callBack(CbcModel *currentSolver, int whereFrom),
+    ampl_info *info);
+
+  /** Handle the BOUNDPROP action: run standalone bound propagation
+      (singletons / fixpoint / MILPbt) on the current model.
+      Extracted from run() — the `case CbcParam::BOUNDPROP:` block.
+      \return 0=success (caller falls through to break), 1=continue the
+              command loop (model invalid, feature disabled, or infeasible)
+  */
+  int runBoundPropagation();
+
+  /** Handle the CLIQUESTRENGTHEN action: run standalone clique
+      strengthening ("before" mode, no resolve) on the current model.
+      Mirrors runBoundPropagation() -- previously clique strengthening had
+      no standalone CLI action, only reachable indirectly through
+      applyLpMethod()/the BAB pipeline.
+      \return 0=success (caller falls through to break), 1=continue the
+              command loop (model invalid)
+  */
+  int runCliqueStrengthening();
+
+  /** Handle the CHECKSOLUTION action: write a solution-validation report
+      (row/column diagnostics) for the current model to a file.
+      Extracted from run() — the `case CbcParam::CHECKSOLUTION:` block.
+      \return 0=success (caller falls through to break), 1=continue the
+              command loop (model invalid or file could not be written)
+  */
+  int runCheckSolution(CbcParam *cbcParam, std::deque< std::string > &inputQueue);
+
+  /** Solve the LP relaxation of the current model via applyLpMethod(),
+      optionally forcing a specific LP method, with the shared LP progress
+      handler set up/torn down around the call, then map the resulting
+      ClpSimplex status onto model_ (and babModel_, if any), print the CLI
+      summary when appropriate, run the "solution found" callback, and
+      populate the AMPL info buffer.
+
+      Backs both the SOLVECONTINUOUS action (forcedMethod == -1, i.e. use
+      the currently configured -lpMethod) and the CLP DUALSIMPLEX /
+      PRIMALSIMPLEX / BARRIER actions (forcedMethod set to force that
+      method) — these four actions used to each keep their own copy of
+      this sequence.
+      Extracted from run() — the `case CbcParam::SOLVECONTINUOUS:` and
+      `case ClpParam::DUALSIMPLEX/PRIMALSIMPLEX/BARRIER:` blocks.
+
+      \param forcedMethod  A CbcParameters::LPMethod value to force, or -1
+                            to use the currently configured -lpMethod.
+      \param callBack       User callback, forwarded from run().
+      \param info           AMPL info struct, forwarded from run().
+      \param returnCode     Set to the value run() should return when this
+                             method returns 3.
+      \return 0=success (caller continues its own control flow), 3=return
+              returnCode from run() (user callback requested an early exit)
+  */
+  int runSolveContinuous(int forcedMethod,
+    int callBack(CbcModel *currentSolver, int whereFrom), ampl_info *info,
+    int &returnCode);
+
+  /** Handle the new first phase of the BAB pipeline: bound propagation +
+      clique merging "before" (via preRootLPStrenghtening()), gated by the
+      -preRootLPStrenghtening meta switch (default on). Extracted out of
+      applyLpMethod() (steps 1-2), which used to run this unconditionally
+      on every LP solve. Also prints the "Root LP relaxation" section
+      banner, so these messages are grouped visually with the root LP solve
+      that immediately follows in babSetupAndRootLp() -> solveInitialLp(),
+      instead of introducing a separate, more verbose section.
+      \return 0=success (caller continues), 2=continue the command loop
+              (infeasibility proved)
+  */
+  int babPreRootLPStrenghtening(int logLevel, int cbcLogLevel);
+
+  /** Handle the setup + root-LP-relaxation portion of the BAB action:
+      cutoff sign flip, printout hints, the legacy OsiSolverLink/quadratic
+      model path (COIN_HAS_LINK), and the solveInitialLp() call.
+      Extracted from run() — the first part of `case CbcParam::BAB:`.
+      \return 0=success (caller continues), 1=break BAB, 2=continue the
+              command loop, 3=return from run() (returnCode is set)
+  */
+  int babSetupAndRootLp(int logLevel, int cbcLogLevel,
+    OsiClpSolverInterface *&clpSolver, ClpSimplex *&lpSolver,
+    CglStored &storedAmpl, CoinModel *&coinModel,
+    CbcSolverStatistics &statistics, int &returnCode,
+    int callBack(CbcModel *currentSolver, int whereFrom));
+
+  /** Handle the legacy OsiSolverLink/quadratic-objective detection and
+      solve path, split out of babSetupAndRootLp() (COIN_HAS_LINK branch;
+      a no-op stub is compiled instead when either CBC_OTHER_SOLVER or
+      !COIN_HAS_LINK applies — those macros aren't visible from this
+      header, only from CbcSolver.cpp, which #define's COIN_HAS_LINK
+      itself). If the current objective is quadratic, this rebuilds
+      model_'s solver as an OsiSolverLink loaded from a CoinModel, solves
+      the linearized SLP relaxation with an inner CbcModel (its own cut
+      generators and heuristics), records the best solution found as
+      model_'s incumbent, and (if the problem is convex) adds an
+      outer-approximation cut to storedAmpl.
+      \param solver         model_.solver(), possibly reassigned to the new
+                              OsiSolverLink.
+      \param lpSolver       Reassigned to match the new solver, when a
+                              quadratic objective is found.
+      \return 0=success (caller continues), 1=break BAB (infeasible via
+              tightenPrimalBounds)
+  */
+  int babSetupQuadraticLink(OsiSolverInterface *&solver,
+    OsiClpSolverInterface *&clpSolver, ClpSimplex *&lpSolver,
+    CoinModel *&coinModel, CglStored &storedAmpl, int &preProcess,
+    int &testOsiParameters, int &complicatedInteger, bool &biLinearProblem);
+
+  /** Configuration for the conflict-graph branching ranker, collected from
+      parameters in run() before `case CbcParam::BAB:` is reached and
+      consumed by babConfigureBabModel(). Field names mirror the run()-scope
+      locals they were extracted from.
+  */
+  struct RankerConfig {
+    /// Weight of the conflict-graph degree component in the branching rank score
+    double rankConflictWeight;
+    /// How conflict/range/nonzero/objective components are combined ("sum" or "product")
+    std::string rankConflictType;
+    /// Exponent applied to the conflict component for variables considered "trusted"
+    double rankConflictPowerTrusted;
+    /// Exponent applied to the conflict component for variables considered "untrusted"
+    double rankConflictPowerUntrusted;
+    /// Weight of the bound-range component in the branching rank score
+    double rankRangeWeight;
+    /// Exponent applied to the range component for "trusted" variables
+    double rankRangePowerTrusted;
+    /// Exponent applied to the range component for "untrusted" variables
+    double rankRangePowerUntrusted;
+    /// Range values above this cap are truncated before scaling (range component)
+    double rankRangeMax;
+    /// Weight of the row-nonzero-count component in the branching rank score
+    double rankNzWeight;
+    /// Exponent applied to the nonzero component for "trusted" variables
+    double rankNzPowerTrusted;
+    /// Exponent applied to the nonzero component for "untrusted" variables
+    double rankNzPowerUntrusted;
+    /// Weight of the objective-coefficient component in the branching rank score
+    double rankObjCoeffWeight;
+    /// Exponent applied to the objective-coefficient component for "trusted" variables
+    double rankObjCoeffPowerTrusted;
+    /// Exponent applied to the objective-coefficient component for "untrusted" variables
+    double rankObjCoeffPowerUntrusted;
+    /// Skip the ranker entirely if the percentage of binary variables reaches this threshold
+    double rankConflictMaxPercBin;
+  };
+
+  /** Handle the babModel_ (re)configuration portion of the BAB action:
+      applies user settings (scaling hint, tighten-bounds-on-continuous
+      infeasibility check), builds the conflict-graph branching ranker (if
+      requested), (re)constructs babModel_ from model_, tunes the
+      factorization frequency, adds lotsizing objects, and decides whether
+      preprocessing should be switched off based on the dual objective
+      limit. Extracted from run() — the second part of `case CbcParam::BAB:`,
+      immediately following babSetupAndRootLp().
+      \return 0=success (caller continues), 1=break BAB (tighten bounds
+              found the problem infeasible)
+  */
+  int babConfigureBabModel(int logLevel,
+    OsiClpSolverInterface *&clpSolver, ClpSimplex *&lpSolver,
+    CglStored &storedAmpl,
+    double time1, double &time2, double &totalTime,
+    const RankerConfig &rankerConfig, int &numberOriginalColumns);
+
+  /** Handle the cgraph/clique-strengthening, preprocessing phase-end
+      banner cleanup, and post-preprocessing bound tightening portion of
+      the BAB action. Extracted from run() — the block immediately
+      following the preprocess() call in `case CbcParam::BAB:`.
+      \return 0=success (caller continues), 1=break BAB (tighten bounds
+              found the problem infeasible)
+  */
+  int babPostPreprocessCleanup(
+    CglPreProcess &process, CglTwomir &twomirGen,
+    CbcPreprocHandler *&preprocHandler, double preprocStart,
+    CbcSolverStatistics &statistics);
+  /** Handle the common post-preprocess BAB search setup: linked-model
+      knapsack expansion, cost-based priorities, heuristic/cut setup,
+      repeated-use solver tuning, debug-value mapping, and the shared
+      branch-and-bound option configuration that runs before search
+      execution. Extracted from run() — the first remaining inline block in
+      `case CbcParam::BAB:` following babPostPreprocessCleanup().
+  */
+  void babConfigureSearchModel(int cbcParamCode,
+    OsiClpSolverInterface *&clpSolver, ClpSimplex *&lpSolver,
+    CglPreProcess &process, CglStored &storedAmpl, CoinModel &saveCoinModel,
+    CoinModel &saveTightenedModel,
+    CoinBronKerbosch::PivotingStrategy bkPivotingStrategy,
+    int *&newPriorities, int &testOsiOptions, bool &integersOK,
+    ampl_info *info);
+  /** Execute the remaining BAB search phase after
+      babConfigureSearchModel(): BAB-specific object/SOS setup, the actual
+      branch-and-bound execution path, search statistics, and the final
+      postprocess() call. Extracted from run() — the remaining inline tail
+      of `case CbcParam::BAB:` after babConfigureSearchModel().
+      \return 0=success (caller breaks BAB), 3=return from run()
+              (returnCode is set)
+  */
+  int babExecuteSearchAndPostprocess(int cbcParamCode, int cbcLogLevel,
+    int testOsiOptions, OsiClpSolverInterface *&clpSolver,
+    ClpSimplex *&lpSolver, OsiClpSolverInterface *originalSolver,
+    CglPreProcess &process, CglStored &storedAmpl,
+    CbcSolverStatistics &statistics,
+    double time1, double time1Elapsed, double &time2, double &totalTime,
+    int truncateColumns, int truncateRows, bool redoSOS,
+    double *&truncatedRhsLower, double *&truncatedRhsUpper,
+    int *&newPriorities, bool integersOK, int numberOriginalColumns,
+    int &returnCode, int callBack(CbcModel *currentSolver, int whereFrom),
+    ampl_info *info);
   //@}
 };
-//#############################################################################
 
-/// Structure to hold useful arrays
-typedef struct {
-  // Priorities
-  int *priorities_;
-  // SOS priorities
-  int *sosPriority_;
-  // Direction to branch first
-  int *branchDirection_;
-  // Input solution
-  double *primalSolution_;
-  // Down pseudo costs
-  double *pseudoDown_;
-  // Up pseudo costs
-  double *pseudoUp_;
-} CbcSolverUsefulData2;
-
-//#############################################################################
-
-/**
-   The CbcSolver class was taken out at a 9/12/09 meeting
-   This is a feeble replacement.
-   At present everything is public
-*/
-class CBCSOLVERLIB_EXPORT  CbcSolverUsefulData {
-
-public:
-  ///@name Constructors and destructors etc
-  //@{
-  /// Default Constructor
-  CbcSolverUsefulData();
-
-  /** Copy constructor .
-     */
-  CbcSolverUsefulData(const CbcSolverUsefulData &rhs);
-
-  /// Assignment operator
-  CbcSolverUsefulData &operator=(const CbcSolverUsefulData &rhs);
-
-  /// Destructor
-  ~CbcSolverUsefulData();
-  //@}
-
-  ///@name Member data
-  //@{
-  // For time
-  double totalTime_;
-  // Parameters
-  std::vector<CbcOrClpParam> parameters_;
-  // Printing
-  bool noPrinting_;
-  // Whether to use signal handler
-  bool useSignalHandler_;
-  // Default pump tuning
-  int initialPumpTune_;
-  // even with verbose >=1  this may not be the first call to
-  // the solver
-  bool printWelcome_;
-
-  //@}
-};
-/// And this uses it
-// When we want to load up CbcModel with options first
-CBCSOLVERLIB_EXPORT
-void CbcMain0(CbcModel &babSolver, CbcSolverUsefulData &solverData);
-CBCSOLVERLIB_EXPORT
-int CbcMain1(int argc, const char *argv[], CbcModel &babSolver, int(CbcModel *currentSolver, int whereFrom), CbcSolverUsefulData &solverData);
-CBCSOLVERLIB_EXPORT
-int CbcMain1(int argc, const char *argv[], CbcModel &babSolver,
-	     CbcSolverUsefulData &solverData);
-
-CBCSOLVERLIB_EXPORT
-int CbcMain(int argc, const char *argv[], CbcModel &babSolver);
-// four ways of calling
-CBCSOLVERLIB_EXPORT
-int callCbc(const char *input2, OsiClpSolverInterface &solver1);
-CBCSOLVERLIB_EXPORT
-int callCbc(const char *input2);
-CBCSOLVERLIB_EXPORT
-int callCbc(const std::string input2, OsiClpSolverInterface &solver1);
-CBCSOLVERLIB_EXPORT
-int callCbc(const std::string input2);
-// two ways of calling
-CBCSOLVERLIB_EXPORT
-int callCbc(const char *input2, CbcModel &babSolver);
-CBCSOLVERLIB_EXPORT
-int callCbc(const std::string input2, CbcModel &babSolver);
-// And when CbcMain0 already called to initialize (with call back) (see CbcMain1 for whereFrom)
-CBCSOLVERLIB_EXPORT
-int callCbc1(const char *input2, CbcModel &babSolver, int(CbcModel *currentSolver, int whereFrom));
-
-//#############################################################################
+// #############################################################################
+// #############################################################################
 
 /*! \brief A class to allow the use of unknown user functionality
 
     For example, access to a modelling language (CbcAmpl).
 */
-class CBCSOLVERLIB_EXPORT  CbcUser {
+class CBCLIB_EXPORT CbcUser {
 
 public:
   ///@name import/export methods
@@ -372,7 +1156,7 @@ public:
 
   /// Get useful stuff
   virtual void fillInformation(CbcSolver * /*model*/,
-    CbcSolverUsefulData & /*info*/) {}
+    CbcParameters & /*info*/) {}
   //@}
 
   ///@name usage methods
@@ -428,14 +1212,16 @@ protected:
 
   //@}
 };
-//#############################################################################
+
+// #############################################################################
+// #############################################################################
 
 /*! \brief Support the use of a call back class to decide whether to stop
 
   Definitely under construction.
 */
 
-class CBCSOLVERLIB_EXPORT CbcStopNow {
+class CBCLIB_EXPORT CbcStopNow {
 
 public:
   ///@name Decision methods
@@ -464,8 +1250,7 @@ public:
   /// Default Constructor
   CbcStopNow();
 
-  /** Copy constructor .
-     */
+  /** Copy constructor. */
   CbcStopNow(const CbcStopNow &rhs);
 
   /// Assignment operator
@@ -483,7 +1268,72 @@ private:
   //@{
   //@}
 };
-#endif
 
-/* vi: softtabstop=2 shiftwidth=2 expandtab tabstop=2
+// ###########################################################################
+//  Default no-op callback for CbcMain1 backward compatibility
+// ###########################################################################
+
+/// Default no-op user callback: always returns 0 (never requests early exit)
+inline int dummyCallback(CbcModel * /*model*/, int /*whereFrom*/) { return 0; }
+
+// #############################################################################
+//  Backward-compatible free functions (delegate to CbcSolver internally)
+// #############################################################################
+
+/// Initialize default parameters (delegates to CbcSolver::initialize)
+CBCLIB_EXPORT
+void CbcMain0(CbcModel &model, CbcParameters &parameters);
+
+/// Run solver with command queue (delegates to CbcSolver::run)
+CBCLIB_EXPORT
+int CbcMain1(std::deque< std::string > inputQueue, CbcModel &model,
+  CbcParameters &parameters,
+  int callBack(CbcModel *currentSolver, int whereFrom) = dummyCallback,
+  ampl_info *info = NULL);
+
+/** Print a general (non-warning) message through the model's message handler.
+    No-op if \p message is empty.
+    \param model    Model whose message handler/registry is used
+    \param message  Text to print
+    \param type     CBC message type code (default CBC_GENERAL)
 */
+void printGeneralMessage(CbcModel &model, std::string message, int type = CBC_GENERAL);
+
+/** Print a warning message through the model's message handler.
+    No-op if \p message is empty.
+    \param model    Model whose message handler/registry is used
+    \param message  Text to print
+    \param type     CBC message type code (default CBC_GENERAL_WARNING)
+*/
+void printGeneralWarning(CbcModel &model, std::string message, int type = CBC_GENERAL_WARNING);
+
+/** Read an AMPL-generated .nl model (via the AMPL Solver Library) into \p model,
+    populating \p info with AMPL-specific data (branching priorities, SOS sets,
+    initial solution, etc.) for later use by CbcSolver::run().
+    \param info  Output: AMPL interface data, filled in from the .nl file
+    \param argc  Argument count (as passed to CbcMain1/CbcSolver::run())
+    \param argv  Argument vector; the .nl filename and AMPL options are parsed from here
+    \param model Model to populate with the imported problem
+    \return 0 on success, nonzero on error
+*/
+CBCLIB_EXPORT
+int cbcReadAmpl(ampl_info *info, int argc, char **argv, CbcModel &model);
+
+// for backward compatibility (samples)
+#define CbcSolverUsefulData CbcParameters
+
+/// Run solver with argc/argv (backward compatible)
+CBCLIB_EXPORT
+int CbcMain1(int argc, const char *argv[],
+  CbcModel &model, CbcParameters &parameterData,
+  int callBack(CbcModel *currentSolver, int whereFrom) = dummyCallback,
+  ampl_info *info = NULL);
+
+/// Run solver with argc/argv, alternate argument order (backward compatible)
+CBCLIB_EXPORT
+int CbcMain1(int argc, const char *argv[],
+  CbcModel &model,
+  int callBack(CbcModel *currentSolver, int whereFrom),
+  CbcParameters &parameterData);
+
+#endif // CbcSolver_H

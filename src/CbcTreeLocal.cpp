@@ -88,7 +88,7 @@ CbcTreeLocal::CbcTreeLocal(CbcModel *model, const double *solution,
     // needed to sync cutoffs
     double value;
     solver->getDblParam(OsiDualObjectiveLimit, value);
-    model_->setCutoff(value * solver->getObjSense());
+    model_->setCutoff(value * solver->getObjSenseInCbc());
   }
   bestCutoff_ = model_->getCutoff();
   // save current gap
@@ -99,7 +99,7 @@ CbcTreeLocal::CbcTreeLocal(CbcModel *model, const double *solution,
   int numberIntegers = model_->numberIntegers();
   const int *integerVariable = model_->integerVariable();
   int i;
-  double direction = solver->getObjSense();
+  double direction = solver->getObjSenseInCbc();
   double newSolutionValue = 1.0e50;
   if (solution) {
     // copy solution
@@ -185,6 +185,10 @@ CbcTreeLocal::CbcTreeLocal(CbcModel *model, const double *solution,
 }
 CbcTreeLocal::~CbcTreeLocal()
 {
+  // Free any nodes still in the tree (e.g. when B&B exits without cleanTree).
+  for (CbcNode *node : nodes_)
+    delete node;
+  nodes_.clear();
   delete[] originalLower_;
   delete[] originalUpper_;
   delete[] bestSolution_;
@@ -314,16 +318,17 @@ CbcTreeLocal::clone() const
 void CbcTreeLocal::passInSolution(const double *solution, double solutionValue)
 {
   int numberColumns = model_->getNumCols();
-  delete[] savedSolution_;
-  savedSolution_ = new double[numberColumns];
-  memcpy(savedSolution_, solution, numberColumns * sizeof(double));
+  double * saveSolution = CoinCopyOfArray(solution,numberColumns);
+  double saveRhs = rhs_;
   rhs_ = range_;
   // Check feasible
   int goodSolution = createCut(solution, cut_);
   if (goodSolution >= 0) {
-    bestCutoff_ = CoinMin(solutionValue, model_->getCutoff());
+    delete [] savedSolution_;
+    savedSolution_ = saveSolution;
+    bestCutoff_ = std::min(solutionValue, model_->getCutoff());
   } else {
-    model_ = NULL;
+    delete [] saveSolution;
   }
 }
 // Return the top node of the heap
@@ -339,10 +344,10 @@ CbcTreeLocal::top() const
   for (int i = 0; i < n; i++) {
     int nn = nodes_[i]->nodeInfo()->nodeNumber();
     double dd = nodes_[i]->objectiveValue();
-    largest = CoinMax(largest, nn);
-    smallest = CoinMin(smallest, nn);
-    largestD = CoinMax(largestD, dd);
-    smallestD = CoinMin(smallestD, dd);
+    largest = std::max(largest, nn);
+    smallest = std::min(smallest, nn);
+    largestD = std::max(largestD, dd);
+    smallestD = std::min(smallestD, dd);
   }
   if (model_->messageHandler()->logLevel() > 1) {
     printf("smallest %d, largest %d, top %d\n", smallest, largest,
@@ -373,9 +378,12 @@ void CbcTreeLocal::push(CbcNode *x)
       // stop on first solution
       searchType_ = 0;
     }
-    startTime_ = static_cast< int >(CoinCpuTime());
+    startTime_ = static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime());
     saveNumberSolutions_ = model_->getSolutionCount();
   }
+  lastObjective_ = x->objectiveValue();
+  lastDepth_ = x->depth();
+  lastUnsatisfied_ = x->numberUnsatisfied();
   nodes_.push_back(x);
 #ifdef CBC_DEBUG
   if (model_->messageHandler()->logLevel() > 0)
@@ -406,7 +414,7 @@ bool CbcTreeLocal::empty()
   int state = 0;
   assert(searchType_ != 2);
   if (searchType_) {
-    if (CoinCpuTime() - startTime_ > timeLimit_ || model_->getNodeCount() - startNode_ >= nodeLimit_) {
+    if ((model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime()) - startTime_ > timeLimit_ || model_->getNodeCount() - startNode_ >= nodeLimit_) {
       state = 4;
     }
   } else {
@@ -440,7 +448,7 @@ bool CbcTreeLocal::empty()
     printf("local state %d after %d nodes and %d seconds, new solution %g, best solution %g, k was %g\n",
       state,
       model_->getNodeCount() - startNode_,
-      static_cast< int >(CoinCpuTime()) - startTime_,
+      static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime()) - startTime_,
       model_->getCutoff() + increment, bestCutoff_ + increment, rhs_);
   saveNumberSolutions_ = model_->getSolutionCount();
   bool finished = false;
@@ -499,6 +507,7 @@ bool CbcTreeLocal::empty()
           // We need to check we have best solution given these 0-1 values
           OsiSolverInterface *subSolver = model_->continuousSolver()->clone();
           CbcModel *subModel = model_->subTreeModel(subSolver);
+          subModel->setMaximumSavedSolutions(0);
           CbcTree normalTree;
           subModel->passInTreeHandler(normalTree);
           int numberIntegers = model_->numberIntegers();
@@ -579,7 +588,8 @@ bool CbcTreeLocal::empty()
       } else {
         searchType_ = 1;
         // delete last cut
-        deleteCut(cut_);
+        if (cut_.row().getNumElements())
+          deleteCut(cut_);
       }
     } else {
       searchType_ = 1;
@@ -600,7 +610,8 @@ bool CbcTreeLocal::empty()
         searchType_ = 0;
       } else {
         // delete last cut
-        deleteCut(cut_);
+        if (cut_.row().getNumElements())
+          deleteCut(cut_);
         searchType_ = 1;
       }
       nextStrong_ = true;
@@ -632,11 +643,13 @@ bool CbcTreeLocal::empty()
       if (model_->messageHandler()->logLevel() > 1)
         printf("inserting cut - now %d cuts, rhs %g %g, cutspace %g, diversification %d\n",
           n, rowCut->lb(), rowCut->ub(), rhs_, diversification_);
+#ifdef CHECK_KNOWN_SOLUTION
       const OsiRowCutDebugger *debugger = model_->solver()->getRowCutDebuggerAlways();
       if (debugger) {
         if (debugger->invalidCut(*rowCut))
           printf("ZZZZTree Global cut - cuts off optimal solution!\n");
       }
+#endif
       for (int i = 0; i < n; i++) {
         rowCut = global->rowCutPtr(i);
         if (model_->messageHandler()->logLevel() > 1)
@@ -645,18 +658,20 @@ bool CbcTreeLocal::empty()
       }
     }
     // put back node
-    startTime_ = static_cast< int >(CoinCpuTime());
+    startTime_ = static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime());
     startNode_ = model_->getNodeCount();
     if (localNode_) {
       // save copy of node
       CbcNode *localNode2 = new CbcNode(*localNode_);
       // But localNode2 now owns cuts so swap
-      //printf("pushing local node2 onto heap %d %x %x\n",localNode_->nodeNumber(),
-      //   localNode_,localNode_->nodeInfo());
       nodes_.push_back(localNode_);
       localNode_ = localNode2;
       std::make_heap(nodes_.begin(), nodes_.end(), comparison_);
     }
+  } else {
+    // local search is finished; localNode_ will not be reused — free it now
+    delete localNode_;
+    localNode_ = nullptr;
   }
   return finished;
 }
@@ -815,7 +830,7 @@ void CbcTreeLocal::reverseCut(int state, double bias)
   double smallest = COIN_DBL_MAX;
   CoinPackedVector row = cut_.row();
   for (int k = 0; k < row.getNumElements(); k++)
-    smallest = CoinMin(smallest, fabs(row.getElements()[k]));
+    smallest = std::min(smallest, fabs(row.getElements()[k]));
   if (!typeCuts_ && !refine_) {
     // Reverse cut very very weakly
     if (state > 2)
@@ -830,11 +845,13 @@ void CbcTreeLocal::reverseCut(int state, double bias)
   if (model_->messageHandler()->logLevel() > 1)
     printf("new rhs %g %g, bias %g smallest %g ",
       rowCut->lb(), rowCut->ub(), bias, smallest);
+#ifdef CHECK_KNOWN_SOLUTION
   const OsiRowCutDebugger *debugger = model_->solver()->getRowCutDebuggerAlways();
   if (debugger) {
     if (debugger->invalidCut(*rowCut))
       printf("ZZZZTree Global cut - cuts off optimal solution!\n");
   }
+#endif
 }
 // Delete last cut branch
 void CbcTreeLocal::deleteCut(OsiRowCut &cut)
@@ -850,7 +867,8 @@ void CbcTreeLocal::deleteCut(OsiRowCut &cut)
       break;
     }
   }
-  assert(i < n);
+  if (i >= n)
+    return; // cut not in global cuts (e.g. cloned sub-model) — nothing to delete
   // delete last cut
   if (model_->messageHandler()->logLevel() > 1)
     printf("deleteCut - deleting cut %d out of %d, rhs %g %g\n",
@@ -949,7 +967,7 @@ CbcTreeVariable::CbcTreeVariable(CbcModel *model, const double *solution,
     // needed to sync cutoffs
     double value;
     solver->getDblParam(OsiDualObjectiveLimit, value);
-    model_->setCutoff(value * solver->getObjSense());
+    model_->setCutoff(value * solver->getObjSenseInCbc());
   }
   bestCutoff_ = model_->getCutoff();
   // save current gap
@@ -960,7 +978,7 @@ CbcTreeVariable::CbcTreeVariable(CbcModel *model, const double *solution,
   int numberIntegers = model_->numberIntegers();
   const int *integerVariable = model_->integerVariable();
   int i;
-  double direction = solver->getObjSense();
+  double direction = solver->getObjSenseInCbc();
   double newSolutionValue = 1.0e50;
   if (solution) {
     // copy solution
@@ -1046,6 +1064,10 @@ CbcTreeVariable::CbcTreeVariable(CbcModel *model, const double *solution,
 }
 CbcTreeVariable::~CbcTreeVariable()
 {
+  // Free any nodes still in the tree (e.g. when B&B exits without cleanTree).
+  for (CbcNode *node : nodes_)
+    delete node;
+  nodes_.clear();
   delete[] originalLower_;
   delete[] originalUpper_;
   delete[] bestSolution_;
@@ -1182,7 +1204,7 @@ void CbcTreeVariable::passInSolution(const double *solution, double solutionValu
   // Check feasible
   int goodSolution = createCut(solution, cut_);
   if (goodSolution >= 0) {
-    bestCutoff_ = CoinMin(solutionValue, model_->getCutoff());
+    bestCutoff_ = std::min(solutionValue, model_->getCutoff());
   } else {
     model_ = NULL;
   }
@@ -1200,10 +1222,10 @@ CbcTreeVariable::top() const
   for (int i = 0; i < n; i++) {
     int nn = nodes_[i]->nodeInfo()->nodeNumber();
     double dd = nodes_[i]->objectiveValue();
-    largest = CoinMax(largest, nn);
-    smallest = CoinMin(smallest, nn);
-    largestD = CoinMax(largestD, dd);
-    smallestD = CoinMin(smallestD, dd);
+    largest = std::max(largest, nn);
+    smallest = std::min(smallest, nn);
+    largestD = std::max(largestD, dd);
+    smallestD = std::min(smallestD, dd);
   }
   if (model_->messageHandler()->logLevel() > 1) {
     printf("smallest %d, largest %d, top %d\n", smallest, largest,
@@ -1234,9 +1256,12 @@ void CbcTreeVariable::push(CbcNode *x)
       // stop on first solution
       searchType_ = 0;
     }
-    startTime_ = static_cast< int >(CoinCpuTime());
+    startTime_ = static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime());
     saveNumberSolutions_ = model_->getSolutionCount();
   }
+  lastObjective_ = x->objectiveValue();
+  lastDepth_ = x->depth();
+  lastUnsatisfied_ = x->numberUnsatisfied();
   nodes_.push_back(x);
 #ifdef CBC_DEBUG
   if (model_->messageHandler()->logLevel() > 0)
@@ -1267,7 +1292,7 @@ bool CbcTreeVariable::empty()
   int state = 0;
   assert(searchType_ != 2);
   if (searchType_) {
-    if (CoinCpuTime() - startTime_ > timeLimit_ || model_->getNodeCount() - startNode_ >= nodeLimit_) {
+    if ((model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime()) - startTime_ > timeLimit_ || model_->getNodeCount() - startNode_ >= nodeLimit_) {
       state = 4;
     }
   } else {
@@ -1301,7 +1326,7 @@ bool CbcTreeVariable::empty()
     printf("local state %d after %d nodes and %d seconds, new solution %g, best solution %g, k was %g\n",
       state,
       model_->getNodeCount() - startNode_,
-      static_cast< int >(CoinCpuTime()) - startTime_,
+      static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime()) - startTime_,
       model_->getCutoff() + increment, bestCutoff_ + increment, rhs_);
   saveNumberSolutions_ = model_->getSolutionCount();
   bool finished = false;
@@ -1360,6 +1385,7 @@ bool CbcTreeVariable::empty()
           // We need to check we have best solution given these 0-1 values
           OsiSolverInterface *subSolver = model_->continuousSolver()->clone();
           CbcModel *subModel = model_->subTreeModel(subSolver);
+          subModel->setMaximumSavedSolutions(0);
           CbcTree normalTree;
           subModel->passInTreeHandler(normalTree);
           int numberIntegers = model_->numberIntegers();
@@ -1440,7 +1466,8 @@ bool CbcTreeVariable::empty()
       } else {
         searchType_ = 1;
         // delete last cut
-        deleteCut(cut_);
+        if (cut_.row().getNumElements())
+          deleteCut(cut_);
       }
     } else {
       searchType_ = 1;
@@ -1461,7 +1488,8 @@ bool CbcTreeVariable::empty()
         searchType_ = 0;
       } else {
         // delete last cut
-        deleteCut(cut_);
+        if (cut_.row().getNumElements())
+          deleteCut(cut_);
         searchType_ = 1;
       }
       nextStrong_ = true;
@@ -1493,11 +1521,13 @@ bool CbcTreeVariable::empty()
       if (model_->messageHandler()->logLevel() > 1)
         printf("inserting cut - now %d cuts, rhs %g %g, cutspace %g, diversification %d\n",
           n, rowCut->lb(), rowCut->ub(), rhs_, diversification_);
+#ifdef CHECK_KNOWN_SOLUTION
       const OsiRowCutDebugger *debugger = model_->solver()->getRowCutDebuggerAlways();
       if (debugger) {
         if (debugger->invalidCut(*rowCut))
           printf("ZZZZTree Global cut - cuts off optimal solution!\n");
       }
+#endif
       for (int i = 0; i < n; i++) {
         rowCut = global->rowCutPtr(i);
         if (model_->messageHandler()->logLevel() > 1)
@@ -1506,7 +1536,7 @@ bool CbcTreeVariable::empty()
       }
     }
     // put back node
-    startTime_ = static_cast< int >(CoinCpuTime());
+    startTime_ = static_cast< int >(model_->useElapsedTime() ? CoinGetTimeOfDay() : CoinCpuTime());
     startNode_ = model_->getNodeCount();
     if (localNode_) {
       // save copy of node
@@ -1518,6 +1548,10 @@ bool CbcTreeVariable::empty()
       localNode_ = localNode2;
       std::make_heap(nodes_.begin(), nodes_.end(), comparison_);
     }
+  } else {
+    // local search is finished; localNode_ will not be reused — free it now
+    delete localNode_;
+    localNode_ = nullptr;
   }
   return finished;
 }
@@ -1667,7 +1701,7 @@ void CbcTreeVariable::reverseCut(int state, double bias)
   double smallest = COIN_DBL_MAX;
   CoinPackedVector row = cut_.row();
   for (int k = 0; k < row.getNumElements(); k++)
-    smallest = CoinMin(smallest, fabs(row.getElements()[k]));
+    smallest = std::min(smallest, fabs(row.getElements()[k]));
   if (!typeCuts_ && !refine_) {
     // Reverse cut very very weakly
     if (state > 2)
@@ -1682,11 +1716,13 @@ void CbcTreeVariable::reverseCut(int state, double bias)
   if (model_->messageHandler()->logLevel() > 1)
     printf("new rhs %g %g, bias %g smallest %g ",
       rowCut->lb(), rowCut->ub(), bias, smallest);
+#ifdef CHECK_KNOWN_SOLUTION
   const OsiRowCutDebugger *debugger = model_->solver()->getRowCutDebuggerAlways();
   if (debugger) {
     if (debugger->invalidCut(*rowCut))
       printf("ZZZZTree Global cut - cuts off optimal solution!\n");
   }
+#endif
 }
 // Delete last cut branch
 void CbcTreeVariable::deleteCut(OsiRowCut &cut)
@@ -1702,7 +1738,8 @@ void CbcTreeVariable::deleteCut(OsiRowCut &cut)
       break;
     }
   }
-  assert(i < n);
+  if (i >= n)
+    return; // cut not in global cuts (e.g. cloned sub-model) — nothing to delete
   // delete last cut
   if (model_->messageHandler()->logLevel() > 1)
     printf("deleteCut - deleting cut %d out of %d, rhs %g %g\n",

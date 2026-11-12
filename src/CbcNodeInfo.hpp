@@ -7,6 +7,7 @@
 #ifndef CbcNodeInfo_H
 #define CbcNodeInfo_H
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,13 @@ class CbcModel;
 class CbcNode;
 class CbcSubProblem;
 class CbcGeneralBranchingObject;
+
+// ints for some counts - which should really be long ints
+#ifdef CBC_MANY_NODE_COUNTS
+typedef long int cbc_node_count;
+#else
+typedef int cbc_node_count;
+#endif
 
 //#############################################################################
 /** Information required to recreate the subproblem at this node
@@ -121,18 +129,17 @@ public:
   virtual CbcNodeInfo *clone() const = 0;
   /// Called when number branches left down to zero
   virtual void allBranchesGone() {}
-#ifndef JJF_ONE
+#if 1 //ndef JJF_ONE
   /// Increment number of references
   inline void increment(int amount = 1)
   {
-    numberPointingToThis_ += amount; /*printf("CbcNodeInfo %x incremented by %d to %d\n",this,amount,numberPointingToThis_);*/
+    numberPointingToThis_.fetch_add(amount, std::memory_order_relaxed);
   }
 
   /// Decrement number of references and return number left
   inline int decrement(int amount = 1)
   {
-    numberPointingToThis_ -= amount; /*printf("CbcNodeInfo %x decremented by %d to %d\n",this,amount,numberPointingToThis_);*/
-    return numberPointingToThis_;
+    return numberPointingToThis_.fetch_sub(amount, std::memory_order_acq_rel) - amount;
   }
 #else
   /// Increment number of references
@@ -147,7 +154,7 @@ public:
 
   inline void initializeInfo(int number)
   {
-    numberPointingToThis_ = number;
+    numberPointingToThis_.store(number, std::memory_order_relaxed);
     numberBranchesLeft_ = number;
   }
 
@@ -166,25 +173,25 @@ public:
   /// Return number of objects pointing to this
   inline int numberPointingToThis() const
   {
-    return numberPointingToThis_;
+    return numberPointingToThis_.load(std::memory_order_relaxed);
   }
 
   /// Set number of objects pointing to this
   inline void setNumberPointingToThis(int number)
   {
-    numberPointingToThis_ = number;
+    numberPointingToThis_.store(number, std::memory_order_relaxed);
   }
 
   /// Increment number of objects pointing to this
   inline void incrementNumberPointingToThis()
   {
-    numberPointingToThis_++;
+    numberPointingToThis_.fetch_add(1, std::memory_order_relaxed);
   }
 
   /// Say one branch taken
   inline int branchedOn()
   {
-    numberPointingToThis_--;
+    numberPointingToThis_.fetch_sub(1, std::memory_order_relaxed);
     numberBranchesLeft_--;
     return numberBranchesLeft_;
   }
@@ -192,7 +199,7 @@ public:
   /// Say thrown away
   inline void throwAway()
   {
-    numberPointingToThis_ -= numberBranchesLeft_;
+    numberPointingToThis_.fetch_sub(numberBranchesLeft_, std::memory_order_relaxed);
     numberBranchesLeft_ = 0;
   }
 
@@ -205,6 +212,11 @@ public:
   inline void nullParent()
   {
     parent_ = NULL;
+  }
+  /// Set parent 
+  inline void setParent(CbcNodeInfo * parent)
+  {
+    parent_ = parent;
   }
 
   void addCuts(OsiCuts &cuts, int numberToBranch, //int * whichGenerator,
@@ -261,11 +273,11 @@ public:
     return owner_;
   }
   /// The node number
-  inline int nodeNumber() const
+  inline cbc_node_count nodeNumber() const
   {
     return nodeNumber_;
   }
-  inline void setNodeNumber(int node)
+  inline void setNodeNumber(cbc_node_count node)
   {
     nodeNumber_ = node;
   }
@@ -307,7 +319,7 @@ public:
   {
     active_ |= 16;
   }
-
+inline int numberRows() const {return numberRows_;}
   /// Branching object for the parent
   inline const OsiBranchingObject *parentBranch() const
   {
@@ -324,7 +336,7 @@ protected:
       `Potential' means children still to be created (#numberBranchesLeft_ of
       this CbcNodeInfo).
     */
-  int numberPointingToThis_;
+  std::atomic<int> numberPointingToThis_;
 
   /// parent
   CbcNodeInfo *parent_;
@@ -339,7 +351,7 @@ protected:
   int numberCuts_;
 
   /// The node number
-  int nodeNumber_;
+  cbc_node_count nodeNumber_;
 
   /// Array of pointers to cuts
   CbcCountRowCut **cuts_;
@@ -365,7 +377,7 @@ protected:
 private:
   /// Illegal Assignment operator
   CbcNodeInfo &operator=(const CbcNodeInfo &rhs);
-
+ public:
   /// routine common to constructors
   void setParentBasedData();
 };

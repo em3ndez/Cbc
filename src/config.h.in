@@ -12,9 +12,8 @@
 /* Library Visibility Attribute */
 #undef CBCUNITTEST_EXPORT
 
-/* Define to the name of the default solver to be used in cbc-generic in small
-   letters */
-#undef CBC_DEFAULT_SOLVER
+/* Git hash at configure time */
+#undef CBC_GIT_HASH
 
 /* Define to 1 if ASL is available. */
 #undef CBC_HAS_ASL
@@ -31,9 +30,6 @@
 /* Define to 1 if the Cplex package is available */
 #undef CBC_HAS_CPLEX
 
-/* Define to 1 if Glpk is available. */
-#undef CBC_HAS_GLPK
-
 /* Define to 1 if Miplib3 is available. */
 #undef CBC_HAS_MIPLIB3
 
@@ -48,21 +44,6 @@
 
 /* Define to 1 if OsiClp is available. */
 #undef CBC_HAS_OSICLP
-
-/* Define to 1 if OsiCpx is available. */
-#undef CBC_HAS_OSICPX
-
-/* Define to 1 if OsiDyLP is available. */
-#undef CBC_HAS_OSIDYLP
-
-/* Define to 1 if OsiGlpk is available. */
-#undef CBC_HAS_OSIGLPK
-
-/* Define to 1 if OsiMsk is available. */
-#undef CBC_HAS_OSIMSK
-
-/* Define to 1 if OsiSpx is available. */
-#undef CBC_HAS_OSISPX
 
 /* Define to 1 if OsiTests is available. */
 #undef CBC_HAS_OSITESTS
@@ -121,7 +102,7 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
-/* Define to 1 if you have the `readline' library (-lreadline). */
+/* Define to 1 if you have the 'readline' library (-lreadline). */
 #undef HAVE_LIBREADLINE
 
 /* Define to 1 if you have the <math.h> header file. */
@@ -189,7 +170,7 @@
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
-/* Define to 1 if all of the C90 standard headers exist (not just the ones
+/* Define to 1 if all of the C89 standard headers exist (not just the ones
    required in a freestanding environment). This macro is provided for
    backward compatibility; new code need not use it. */
 #undef STDC_HEADERS

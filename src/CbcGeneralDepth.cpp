@@ -25,11 +25,35 @@
 #include "CoinSort.hpp"
 #include "CoinError.hpp"
 
-#ifdef CBC_HAS_CLP
 #include "OsiClpSolverInterface.hpp"
 #include "CoinWarmStartBasis.hpp"
 #include "ClpNode.hpp"
+#include "ClpFactorization.hpp"
 #include "CbcBranchDynamic.hpp"
+#include "OsiRowCutDebugger.hpp"
+
+//#define CHECK_PATH
+#ifdef CHECK_PATH
+extern const double *debuggerSolution_Z;
+extern int numberColumns_Z;
+#endif
+/* I (JJHF) am looking at the fathomMany option in Cbc.  This does a few 
+   branches using Clp and tries to be much more efficient as it knows
+   about Clp.  It will also lend itself well to deterministc parallel
+   and that is what this update to master is all about.  As checked in
+   this time it should give identical results as before but now allows
+   fathomMany in deterministic parallel.  fathomMany is switched on by 
+   -depth +n which varies size of mini tree.  Deterministic parallel
+   is switched on by -thread 10k where k is number of threads
+   (k > number of cpus can be good).
+
+   I will be trying to tune further.  Ideas which seem possible but
+   changed current behavior will be found in areas marked with
+   DETERMINISTIC_TUNING e.g.
+   // DETERMINISTIC_TUNING think harder or
+   #if 0 // DETERMINISTIC_TUNING or just
+   #if DETERMINISTIC_TUNING > n etc
+*/
 // Default Constructor
 CbcGeneralDepth::CbcGeneralDepth()
   : CbcGeneral()
@@ -50,24 +74,33 @@ CbcGeneralDepth::CbcGeneralDepth(CbcModel *model, int maximumDepth)
   , numberNodes_(0)
   , nodeInfo_(NULL)
 {
-  assert(maximumDepth_ < 1000000);
+  assert(maximumDepth_ < 10000000);
   if (maximumDepth_ == 0)
     maximumDepth_ = 1;
+  // DETERMINISTIC_TUNING think harder
+#define MAX_DEPTH 1000
+#define MAX_NODES 200
+  int realMaximumDepth = maximumDepth_ % MAX_DEPTH;
   if (maximumDepth_ > 0)
-    maximumNodes_ = (1 << maximumDepth_) + 1 + maximumDepth_;
+    maximumNodes_ = (1 << realMaximumDepth) + 1 + realMaximumDepth;
   else 
     maximumNodes_ = 1 + 1 - maximumDepth_;
-#define MAX_NODES 100
-  maximumNodes_ = CoinMin(maximumNodes_, 1 + abs(maximumDepth_) + MAX_NODES);
-  maximumNodes_ = CoinMax(maximumNodes_, 4);
-  if (maximumNodes_) {
+  maximumNodes_ = std::min(maximumNodes_, 1 + abs(realMaximumDepth) + MAX_NODES);
+  maximumNodes_ = std::max(maximumNodes_, 10);
+  // special for 1
+  if (maximumDepth_==1) {
+    // DETERMINISTIC_TUNING think harder
+    // amount will vary
+    maximumNodes_ = 1 + 20 + MAX_NODES; 
+  }
+  {
     nodeInfo_ = new ClpNodeStuff();
     nodeInfo_->maximumNodes_ = maximumNodes_;
     ClpNodeStuff *info = nodeInfo_;
     // for reduced costs and duals
     info->solverOptions_ |= 7;
     if (maximumDepth_ > 0) {
-      info->nDepth_ = maximumDepth_;
+      info->nDepth_ = realMaximumDepth;
     } else {
       info->nDepth_ = -maximumDepth_;
       info->solverOptions_ |= 32;
@@ -76,8 +109,6 @@ CbcGeneralDepth::CbcGeneralDepth(CbcModel *model, int maximumDepth)
     for (int i = 0; i < maximumNodes_; i++)
       nodeInfo[i] = NULL;
     info->nodeInfo_ = nodeInfo;
-  } else {
-    nodeInfo_ = NULL;
   }
 }
 
@@ -86,6 +117,7 @@ CbcGeneralDepth::CbcGeneralDepth(const CbcGeneralDepth &rhs)
   : CbcGeneral(rhs)
 {
   maximumDepth_ = rhs.maximumDepth_;
+  int realMaximumDepth = maximumDepth_ % MAX_DEPTH;
   maximumNodes_ = rhs.maximumNodes_;
   whichSolution_ = -1;
   numberNodes_ = 0;
@@ -95,7 +127,7 @@ CbcGeneralDepth::CbcGeneralDepth(const CbcGeneralDepth &rhs)
     nodeInfo_->maximumNodes_ = maximumNodes_;
     ClpNodeStuff *info = nodeInfo_;
     if (maximumDepth_ > 0) {
-      info->nDepth_ = maximumDepth_;
+      info->nDepth_ = realMaximumDepth;
     } else {
       info->nDepth_ = -maximumDepth_;
       info->solverOptions_ |= 32;
@@ -126,6 +158,7 @@ CbcGeneralDepth::operator=(const CbcGeneralDepth &rhs)
     CbcGeneral::operator=(rhs);
     delete nodeInfo_;
     maximumDepth_ = rhs.maximumDepth_;
+    int realMaximumDepth = maximumDepth_ % MAX_DEPTH;
     maximumNodes_ = rhs.maximumNodes_;
     whichSolution_ = -1;
     numberNodes_ = 0;
@@ -151,6 +184,22 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
   int & /*preferredWay*/) const
 {
   whichSolution_ = -1;
+  if (maximumDepth_==1) {
+    // DETERMINISTIC_TUNING think harder
+    // vary
+    cbc_node_count nfathoms = model_->getFathomCount();
+    int depth =5 ;
+    while (nfathoms && depth <20) {
+      nfathoms /= 2;
+      depth++;
+    }
+    int nnodes = (1 << depth) + 1 + depth;
+    nnodes = std::min(nnodes, 1 + 20 + MAX_NODES);
+    nnodes = std::max(nnodes, 10);
+    nodeInfo_->maximumNodes_ = nnodes;
+    nodeInfo_->nDepth_ = depth;
+  }
+  double returnValue;
   // should use genuine OsiBranchingInformation usefulInfo = model_->usefulInformation();
   // for now assume only called when correct
   //if (usefulInfo.depth_>=4&&!model_->parentModel()
@@ -158,7 +207,7 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
   if (true) {
     OsiSolverInterface *solver = model_->solver();
     OsiClpSolverInterface *clpSolver
-      = dynamic_cast< OsiClpSolverInterface * >(solver);
+      = getClpSolver(solver);
     if (clpSolver) {
       if ((model_->moreSpecialOptions() & 33554432) == 0) {
         ClpNodeStuff *info = nodeInfo_;
@@ -167,11 +216,11 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
         info->numberBeforeTrust_ = model_->numberBeforeTrust();
         info->stateOfSearch_ = model_->stateOfSearch();
         // Compute "small" change in branch
-        int nBranches = model_->getIntParam(CbcModel::CbcNumberBranches);
-        if (nBranches) {
+        long int nBranches = model_->getNodeCount();
+        if (nBranches) { 
           double average = model_->getDblParam(CbcModel::CbcSumChange) / static_cast< double >(nBranches);
-          info->smallChange_ = CoinMax(average * 1.0e-5, model_->getDblParam(CbcModel::CbcSmallestChange));
-          info->smallChange_ = CoinMax(info->smallChange_, 1.0e-8);
+          info->smallChange_ = std::max(average * 1.0e-5, model_->getDblParam(CbcModel::CbcSmallestChange));
+          info->smallChange_ = std::max(info->smallChange_, 1.0e-8);
         } else {
           info->smallChange_ = 1.0e-8;
         }
@@ -188,9 +237,32 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
         info->fillPseudoCosts(down, up, priority, numberDown, numberUp,
           numberDownInfeasible,
           numberUpInfeasible, numberIntegers);
+	// possible bug if 0 as can have mismatch on dense/nondense factorization
+	// could check if number rows large enough
         info->presolveType_ = 1;
+	ClpSimplex *simplex = clpSolver->getModelPtr();
+	int numberRows = simplex->numberRows();
+	if (simplex->factorization()->goDenseThreshold() < numberRows) {
+	  const double *lower = simplex->columnLower();
+	  const double *upper = simplex->columnUpper();
+	  const int *integerVariable = model_->integerVariable();
+	  int nFixed = 0;
+	  for (int i=0;i<numberIntegers;i++) {
+	    int iColumn = integerVariable[i];
+	    if (upper[iColumn]==lower[iColumn])
+	      nFixed++;
+	  }
+	  if (nFixed*2<numberIntegers) {
+	    info->presolveType_=0;
+	    for (int i=0;i<info->maximumNodes_;i++) {
+	      if (info->nodeInfo_[i]) 
+		info->nodeInfo_[i]->cleanUpForCrunch();
+	    }
+	  }
+	}
         delete[] down;
         delete[] up;
+	delete[] priority;
         delete[] numberDown;
         delete[] numberUp;
         delete[] numberDownInfeasible;
@@ -198,12 +270,50 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
         bool takeHint;
         OsiHintStrength strength;
         solver->getHintParam(OsiDoReducePrint, takeHint, strength);
-        ClpSimplex *simplex = clpSolver->getModelPtr();
         int saveLevel = simplex->logLevel();
         if (strength != OsiHintIgnore && takeHint && saveLevel == 1)
           simplex->setLogLevel(0);
         clpSolver->setBasis();
+	// DETERMINISTIC_TUNING think harder
+	//info->presolveType_=1;
+        int numberColumns = simplex->numberColumns();
+        double *saveColumnLower = CoinCopyOfArray(simplex->columnLower(), numberColumns);
+        double *saveColumnUpper = CoinCopyOfArray(simplex->columnUpper(), numberColumns);
+#ifdef CHECK_PATH
+        // Feed fathomMany()'s built-in "on optimal path" tracer the known
+        // reference solution (already remapped into the current, possibly
+        // preprocessed, column space by CbcModel's -debugCuts handling),
+        // if the row cut debugger is active. Use getRowCutDebuggerAlways()
+        // (not getRowCutDebugger()) since the latter returns NULL once the
+        // current node's bounds have already excluded the known solution -
+        // exactly the case we need to trace here.
+        {
+          const OsiRowCutDebugger *debugger = solver->getRowCutDebuggerAlways();
+          static int printedOnce = 0;
+          if (!printedOnce) {
+            printedOnce = 1;
+            fprintf(stderr, "CHECK_PATH: debugger=%p numberColumns=%d\n", (void*)debugger, numberColumns);
+          }
+          if (debugger && solver->getNumCols() == numberColumns) {
+            debuggerSolution_Z = debugger->optimalSolution();
+            numberColumns_Z = numberColumns;
+          }
+        }
+#endif
         whichSolution_ = simplex->fathomMany(info);
+        // ClpSimplexOther::crunch() (called from fathomMany(), with
+        // tightenBounds true) can permanently tighten simplex's own
+        // columnLower_/columnUpper_ based on reduced-cost bound
+        // tightening computed relative to THIS mini-BAB call's root bounds.
+        // Those tightened bounds are only valid within this subtree; if left
+        // in place they silently and incorrectly restrict every other
+        // branch/node explored afterwards, corrupting the search (observed
+        // to cause proven-optimal objectives worse than the true optimum).
+        // Always restore the original bounds here.
+        CoinMemcpyN(saveColumnLower, numberColumns, simplex->columnLower());
+        CoinMemcpyN(saveColumnUpper, numberColumns, simplex->columnUpper());
+        delete[] saveColumnLower;
+        delete[] saveColumnUpper;
         //printf("FAT %d nodes, %d iterations\n",
         //info->numberNodesExplored_,info->numberIterations_);
         //printf("CbcBranch %d rows, %d columns\n",clpSolver->getNumRows(),
@@ -285,17 +395,19 @@ CbcGeneralDepth::infeasibility(const OsiBranchingInformation * /*info*/,
       }
       int numberDo = numberNodes_;
       if (numberDo > 0 || whichSolution_ >= 0) {
-        return 0.5;
+        returnValue = 0.5;
       } else {
         // no solution
-        return COIN_DBL_MAX; // say infeasible
+        returnValue = COIN_DBL_MAX; // say infeasible
       }
     } else {
-      return -1.0;
+      returnValue = -1.0;
     }
   } else {
-    return -1.0;
+    returnValue = -1.0;
   }
+  //nodeInfo_->maximumNodes_ = saveMaximumNodes;
+  return returnValue;
 }
 
 // This looks at solution and sets bounds to contain solution
@@ -310,10 +422,7 @@ void CbcGeneralDepth::redoSequenceEtc(CbcModel * /*model*/,
 {
 }
 
-//#define CHECK_PATH
 #ifdef CHECK_PATH
-extern const double *debuggerSolution_Z;
-extern int numberColumns_Z;
 extern int gotGoodNode_Z;
 #endif
 CbcBranchingObject *
@@ -340,7 +449,7 @@ CbcGeneralDepth::createCbcBranch(OsiSolverInterface *solver, const OsiBranchingI
   int iNode;
   //OsiSolverInterface * solver = model_->solver();
   OsiClpSolverInterface *clpSolver
-    = dynamic_cast< OsiClpSolverInterface * >(solver);
+    = getClpSolver(solver);
   assert(clpSolver);
   ClpSimplex *simplex = clpSolver->getModelPtr();
   int numberColumns = simplex->numberColumns();
@@ -551,7 +660,7 @@ CbcGeneralBranchingObject::branch()
         OsiSolverInterface *solver = model_->solver();
         thisProb->apply(solver);
         OsiClpSolverInterface *clpSolver
-          = dynamic_cast< OsiClpSolverInterface * >(solver);
+          = getClpSolver(solver);
         assert(clpSolver);
         // Move status to basis
         clpSolver->setWarmStart(NULL);
@@ -711,6 +820,7 @@ CbcOneGeneralBranchingObject::branch()
   decrementNumberBranchesLeft();
   assert(!numberBranchesLeft());
   object_->setWhichNode(whichOne_);
+  object_->setModel(model_);
   object_->branch();
   return 0.0;
 }
@@ -750,7 +860,6 @@ CbcOneGeneralBranchingObject::compareBranchingObject(const CbcBranchingObject * 
 {
   throw("must implement");
 }
-#endif
 
 /* vi: softtabstop=2 shiftwidth=2 expandtab tabstop=2
 */

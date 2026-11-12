@@ -18,6 +18,7 @@
 #include "CbcBranchActual.hpp"
 #include "CbcStrategy.hpp"
 #include "CglPreProcess.hpp"
+#include "CbcHeuristicRinsFixtureDump.hpp"
 
 // Default Constructor
 CbcHeuristicRINS::CbcHeuristicRINS()
@@ -32,6 +33,7 @@ CbcHeuristicRINS::CbcHeuristicRINS()
   howOften_ = 100;
   decayFactor_ = 0.5;
   used_ = NULL;
+  fixCloseMaxDist_ = 0.4;
   whereFrom_ = 1 + 8 + 16 + 255 * 256;
   whereFrom_ = 1 + 8 + 255 * 256;
 }
@@ -53,6 +55,7 @@ CbcHeuristicRINS::CbcHeuristicRINS(CbcModel &model)
   int numberColumns = model.solver()->getNumCols();
   used_ = new char[numberColumns];
   memset(used_, 0, numberColumns);
+  fixCloseMaxDist_ = 0.4;
   whereFrom_ = 1 + 8 + 16 + 255 * 256;
   whereFrom_ = 1 + 8 + 255 * 256;
 }
@@ -82,6 +85,7 @@ CbcHeuristicRINS::operator=(const CbcHeuristicRINS &rhs)
     numberTries_ = rhs.numberTries_;
     stateOfFixing_ = rhs.stateOfFixing_;
     lastNode_ = rhs.lastNode_;
+    fixCloseMaxDist_ = rhs.fixCloseMaxDist_;
     delete[] used_;
     if (model_ && rhs.used_) {
       int numberColumns = model_->solver()->getNumCols();
@@ -117,6 +121,7 @@ CbcHeuristicRINS::CbcHeuristicRINS(const CbcHeuristicRINS &rhs)
   , numberTries_(rhs.numberTries_)
   , stateOfFixing_(rhs.stateOfFixing_)
   , lastNode_(rhs.lastNode_)
+  , fixCloseMaxDist_(rhs.fixCloseMaxDist_)
 {
   if (model_ && rhs.used_) {
     int numberColumns = model_->solver()->getNumCols();
@@ -147,11 +152,11 @@ void CbcHeuristicRINS::resetModel(CbcModel * /*model*/)
 int CbcHeuristicRINS::solution(double &solutionValue,
   double *betterSolution)
 {
-  numCouldRun_++;
   int returnCode = 0;
   const double *bestSolution = model_->bestSolution();
   if (!bestSolution)
-    return 0; // No solution found yet
+    return -2; // Cannot run — no incumbent solution yet
+  numCouldRun_++;
 #ifdef HEURISTIC_INFORM
   printf("Entering heuristic %s - nRuns %d numCould %d when %d\n",
     heuristicName(), numRuns_, numCouldRun_, when_);
@@ -187,21 +192,49 @@ int CbcHeuristicRINS::solution(double &solutionValue,
       }
     }
   }
-  int numberNodes = model_->getNodeCount();
-  if (howOften_ == 100) {
-    if (numberNodes < lastNode_ + 12)
-      return 0;
-    // Do at 50 and 100
-    if ((numberNodes > 40 && numberNodes <= 50) || (numberNodes > 90 && numberNodes < 100))
+  const bool passOK = (model_->getCurrentPassNumber() <= 1 || model_->getCurrentPassNumber() == 999999);
+  bool runNow;
+  if (scheduleMode() != HeuristicScheduleMode::Legacy) {
+    // See CbcHeuristic::shouldRunBySchedule() / setScheduleMode() --
+    // replaces the magic-number node-count math below with an explicit,
+    // named policy. Must still call shouldRunBySchedule() exactly once
+    // per candidate invocation to keep its internal bookkeeping correct,
+    // even when passOK is false (so a multi-pass node doesn't get
+    // double-counted against the schedule).
+    runNow = shouldRunBySchedule() && passOK;
+  } else {
+    int numberNodes = model_->getNodeCount();
+    if (howOften_ == 100) {
+      if (numberNodes < lastNode_ + 12)
+        return 0;
+      // Do at 50 and 100
+      if ((numberNodes > 40 && numberNodes <= 50) || (numberNodes > 90 && numberNodes < 100))
+        numberNodes = howOften_;
+    }
+    // Allow for infeasible nodes - so do anyway after a bit
+    if (howOften_ >= 100 && numberNodes >= lastNode_ + 2 * howOften_) {
       numberNodes = howOften_;
+    }
+    runNow = (numberNodes % howOften_) == 0 && passOK && shouldRunBySchedule();
   }
-  // Allow for infeasible nodes - so do anyway after a bit
-  if (howOften_ >= 100 && numberNodes >= lastNode_ + 2 * howOften_) {
-    numberNodes = howOften_;
-  }
-  if ((numberNodes % howOften_) == 0 && (model_->getCurrentPassNumber() <= 1 || model_->getCurrentPassNumber() == 999999)) {
+  if (runNow) {
     lastNode_ = model_->getNodeCount();
+    RunGuard runGuard(this);
+    const int successesBefore = numberSuccesses_;
+#ifdef RINS_CLOSE_DEBUG
+    printf("RINS close-fix: entering work block at node=%d passNumber=%d\n",
+      model_->getNodeCount(), model_->getCurrentPassNumber());
+#endif
     OsiSolverInterface *solver = model_->solver();
+
+#ifdef CBC_DUMP_RINS_FIXTURE
+    // Dump once, at the first opportunity RINS actually reaches this block
+    // with an incumbent present, then exit -- see
+    // CbcHeuristicRinsFixtureDump.hpp / RINS-FIXTURES.md. Bounds the cost of
+    // fixture generation the same way -maxNodes 1 bounds gen-root-fixtures.
+    if (cbcDumpRinsFixture(model_, solver, bestSolution))
+      exit(0);
+#endif
 
     int numberIntegers = model_->numberIntegers();
     const int *integerVariable = model_->integerVariable();
@@ -267,6 +300,111 @@ int CbcHeuristicRINS::solution(double &solutionValue,
       }
     }
     int divisor = 0;
+    // Note: nFix counts only vars directly agreed between LP and best solution.
+    // Variables that would be additionally fixed by consequence (via the fast
+    // pre-processing inside smallBranchAndBound) are NOT counted here, so the
+    // threshold below may be overly conservative.
+#ifdef RINS_CLOSE_DEBUG
+    {
+      // Count candidates for close-fixing (regardless of threshold) for diagnostics
+      int nExact = nFix;
+      const double *cln = newSolver->getColLower();
+      const double *cun = newSolver->getColUpper();
+      int nCloseAvail = 0;
+      for (int ii = 0; ii < numberIntegers; ii++) {
+        int ic = integerVariable[ii];
+        if (!isHeuristicInteger(solver, ic)) continue;
+        if (cln[ic] == cun[ic]) continue;
+        const OsiObject *obj = model_->object(ii);
+        double lo, hi;
+        getIntegerInformation(obj, lo, hi);
+        double vb = bestSolution[ic];
+        if (vb < lo) vb = lo; else if (vb > hi) vb = hi;
+        double nr = floor(vb + 0.5);
+        double dist = fabs(currentSolution[ic] - nr);
+        if (dist >= 10.0 * primalTolerance && dist <= fixCloseMaxDist_) nCloseAvail++;
+      }
+      printf("RINS@node=%d: nExact=%d nIntegers=%d (%.1f%%) | closeAvail=%d | threshold=%s\n",
+        model_->getNodeCount(), nExact, numberIntegers,
+        100.0 * nExact / (numberIntegers ? numberIntegers : 1),
+        nCloseAvail,
+        (5 * nExact > numberIntegers) ? "MET" : "NOT MET");
+    }
+#endif
+
+    // Close-fixing fallback: when the threshold is not met, additionally fix
+    // integer variables whose current LP value is within fixCloseMaxDist_ of
+    // the best-solution integer value.  Variables are sorted by closeness
+    // (ascending) and greedily fixed until the threshold is satisfied.
+    if (5 * nFix <= numberIntegers && fixCloseMaxDist_ > 0.0) {
+      const double *colLowerNew = newSolver->getColLower();
+      const double *colUpperNew = newSolver->getColUpper();
+      double *sortDist = new double[numberIntegers];
+      int *whichClose = new int[numberIntegers];
+      int nClose = 0;
+      for (i = 0; i < numberIntegers; i++) {
+        int iColumn = integerVariable[i];
+        if (!isHeuristicInteger(solver, iColumn))
+          continue;
+        if (colLowerNew[iColumn] == colUpperNew[iColumn])
+          continue; // already fixed in the exact-match pass
+        const OsiObject *object = model_->object(i);
+        double originalLower;
+        double originalUpper;
+        getIntegerInformation(object, originalLower, originalUpper);
+        double valueInt = bestSolution[iColumn];
+        if (valueInt < originalLower)
+          valueInt = originalLower;
+        else if (valueInt > originalUpper)
+          valueInt = originalUpper;
+        double nearest = floor(valueInt + 0.5);
+        double dist = fabs(currentSolution[iColumn] - nearest);
+        if (dist < 10.0 * primalTolerance || dist > fixCloseMaxDist_)
+          continue;
+        // Apply the same shallowDepth_ filter used in the exact-match pass
+        bool include = false;
+        switch (shallowDepth_) {
+        case 0:
+          include = true;
+          break;
+        case 1:
+          include = (nearest == originalLower);
+          break;
+        case 2:
+          include = (nearest != originalLower);
+          break;
+        case 3:
+          include = (nearest == originalLower && !used[iColumn]);
+          break;
+        default:
+          include = true;
+          break;
+        }
+        if (include) {
+          sortDist[nClose] = dist;
+          whichClose[nClose++] = iColumn;
+        }
+      }
+      // Sort closest first
+      CoinSort_2(sortDist, sortDist + nClose, whichClose);
+      int nFixBefore = nFix;
+      // Greedily fix until threshold is met or candidates exhausted
+      for (int j = 0; j < nClose && 5 * nFix <= numberIntegers; j++) {
+        int iColumn = whichClose[j];
+        double nearest = floor(bestSolution[iColumn] + 0.5);
+        newSolver->setColLower(iColumn, nearest);
+        newSolver->setColUpper(iColumn, nearest);
+        nFix++;
+      }
+#ifdef RINS_CLOSE_DEBUG
+      printf("RINS close-fix fallback: added %d vars (nFix %d->%d), candidates=%d, threshold_met=%s\n",
+        nFix - nFixBefore, nFixBefore, nFix, nClose,
+        (5 * nFix > numberIntegers) ? "YES" : "NO");
+#endif
+      delete[] sortDist;
+      delete[] whichClose;
+    }
+
     if (5 * nFix > numberIntegers) {
       if (numberContinuous > 2 * numberIntegers && ((nFix * 10 < numberColumns && !numRuns_ && numberTries_ > 2) || stateOfFixing_)) {
 #define RINS_FIX_CONTINUOUS
@@ -291,7 +429,7 @@ int CbcHeuristicRINS::solution(double &solutionValue,
           // fix some continuous
           double *sort = new double[nAtLb];
           int *which = new int[nAtLb];
-          //double threshold = CoinMax((0.01*sumDj)/static_cast<double>(nAtLb),1.0e-6);
+          //double threshold = std::max((0.01*sumDj)/static_cast<double>(nAtLb),1.0e-6);
           int nFix2 = 0;
           for (int iColumn = 0; iColumn < numberColumns; iColumn++) {
             if (!isHeuristicInteger(newSolver, iColumn)) {
@@ -311,7 +449,7 @@ int CbcHeuristicRINS::solution(double &solutionValue,
             divisor = stateOfFixing_;
           else if (stateOfFixing_ < -1)
             divisor = (-stateOfFixing_) - 1;
-          nFix2 = CoinMin(nFix2, (numberColumns - nFix) / divisor);
+          nFix2 = std::min(nFix2, (numberColumns - nFix) / divisor);
           for (int i = 0; i < nFix2; i++) {
             int iColumn = which[i];
             newSolver->setColUpper(iColumn, colLower[iColumn]);
@@ -339,6 +477,10 @@ int CbcHeuristicRINS::solution(double &solutionValue,
         return 0;
       }
       //printf("RINS %d integers have same value\n",nFix);
+      if (model_->maximumSecondsReached()) {
+        delete newSolver;
+        return 0;
+      }
       returnCode = smallBranchAndBound(newSolver, numberNodes_, betterSolution, solutionValue,
         model_->getCutoff(), "CbcHeuristicRINS");
       if (returnCode < 0) {
@@ -366,8 +508,7 @@ int CbcHeuristicRINS::solution(double &solutionValue,
     }
 
     numberTries_++;
-    if ((numberTries_ % 10) == 0 && numberSuccesses_ * 3 < numberTries_)
-      howOften_ += static_cast< int >(howOften_ * decayFactor_);
+    runGuard.finish(numberSuccesses_ > successesBefore);
     delete newSolver;
   }
   return returnCode;
